@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.feature_extraction.text import TfidfVectorizer  # CHANGED from CountVectorizer
 from sentence_transformers import SentenceTransformer
 from sklearn.preprocessing import StandardScaler
 
@@ -28,7 +28,6 @@ class ContextFusion:
 class LabSpecialist:
     def __init__(self):
         self.name = "Spec_Labs"
-        # Gradient Boosting is best for dense numeric data (Labs/Vitals)
         self.model = HistGradientBoostingClassifier(learning_rate=0.05, max_iter=300)
         self.fusion = ContextFusion()
 
@@ -48,22 +47,29 @@ class LabSpecialist:
 class NoteSpecialist:
     def __init__(self):
         self.name = "Spec_Notes"
+        # Use a slightly larger model if GPU available, otherwise keep MiniLM
         self.encoder = SentenceTransformer('all-MiniLM-L6-v2')
-        # INCREASED MAX_ITER to 1000 to prevent warnings
         self.model = LogisticRegression(class_weight='balanced', max_iter=1000)
         self.fusion = ContextFusion()
 
+    def _preprocess(self, text_list):
+        # FIX: Take the LAST 2000 chars (Discharge instructions/Plan), not the first.
+        # If text is shorter than 2000, it takes the whole thing.
+        return [str(t)[-2000:] for t in text_list]
+
     def learn(self, text_list, context, y):
-        print(f"   📖 [{self.name}] Learning from Notes + Context...")
+        print(f"   📖 [{self.name}] Learning from Notes (Discharge Plan Focus)...")
         self.fusion.fit(context)
-        short_text = [str(t)[:1000] for t in text_list]
-        embeds = self.encoder.encode(short_text, batch_size=64, show_progress_bar=True)
+        
+        processed_text = self._preprocess(text_list)
+        embeds = self.encoder.encode(processed_text, batch_size=64, show_progress_bar=True)
+        
         X_final = self.fusion.merge(embeds, context)
         self.model.fit(X_final, y)
 
     def give_opinion(self, text_list, context):
-        short_text = [str(t)[:1000] for t in text_list]
-        embeds = self.encoder.encode(short_text, batch_size=64)
+        processed_text = self._preprocess(text_list)
+        embeds = self.encoder.encode(processed_text, batch_size=64)
         X_final = self.fusion.merge(embeds, context)
         return self.model.predict_proba(X_final)[:, 1]
 
@@ -73,9 +79,8 @@ class NoteSpecialist:
 class PharmacySpecialist:
     def __init__(self):
         self.name = "Spec_Pharm"
-        self.vectorizer = CountVectorizer(max_features=500, stop_words='english')
-        # SOLVER CHANGED TO 'liblinear' (Faster for sparse data)
-        # MAX_ITER INCREASED
+        # CHANGE: TF-IDF captures "rare" drugs (often for severe conditions) better than counts
+        self.vectorizer = TfidfVectorizer(max_features=800, stop_words='english')
         self.model = LogisticRegression(class_weight='balanced', solver='liblinear', max_iter=1000)
         self.fusion = ContextFusion()
 
@@ -97,9 +102,9 @@ class PharmacySpecialist:
 class HistorySpecialist:
     def __init__(self):
         self.name = "Spec_Hist"
-        # Increased features slightly to capture more ICD codes
-        self.vectorizer = CountVectorizer(max_features=800)
-        # SOLVER CHANGED TO 'liblinear'
+        # CHANGE: Increased features to 1500 to capture more specific ICD codes
+        # CHANGE: TF-IDF downweights common codes (e.g., "Hypertension") to focus on specific comorbidities
+        self.vectorizer = TfidfVectorizer(max_features=1500)
         self.model = LogisticRegression(class_weight='balanced', solver='liblinear', max_iter=1000)
         self.fusion = ContextFusion()
 
