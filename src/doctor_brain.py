@@ -29,9 +29,13 @@ class DoctorAgent:
         X_context = df[CONTEXT_COLS].fillna(0)
         
         print("\n--- PHASE 1: SPECIALIST TRAINING ---")
-        # Labs
+        # Labs - only numeric columns (exclude text, context, IDs, and any string columns)
         drop_cols = TEXT_COLS + CONTEXT_COLS + ID_COLS + [TARGET]
-        X_lab = df.drop(columns=drop_cols, errors='ignore').fillna(0)
+        # Also drop any non-numeric columns (like 'curr_service', 'procedure_list_text', etc.)
+        X_lab = df.drop(columns=drop_cols, errors='ignore')
+        # Select only numeric columns
+        X_lab = X_lab.select_dtypes(include=[np.number]).fillna(0)
+        print(f"  Lab features: {X_lab.shape[1]} numeric columns")
         self.spec_lab.learn(X_lab, X_context, y)
         
         # Others
@@ -62,7 +66,9 @@ class DoctorAgent:
         
         # Get Opinions
         drop_cols = TEXT_COLS + CONTEXT_COLS + ID_COLS + [TARGET]
-        X_lab = df.drop(columns=drop_cols, errors='ignore').fillna(0)
+        X_lab = df.drop(columns=drop_cols, errors='ignore')
+        # Select only numeric columns
+        X_lab = X_lab.select_dtypes(include=[np.number]).fillna(0)
         
         op_lab = self.spec_lab.give_opinion(X_lab, X_context)
         op_note = self.spec_note.give_opinion(df['clinical_text'].fillna(""), X_context)
