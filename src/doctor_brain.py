@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import GradientBoostingClassifier
-from sklearn.metrics import roc_auc_score, precision_recall_curve
+from sklearn.metrics import roc_auc_score, precision_recall_curve, precision_score, recall_score, f1_score, confusion_matrix
 
 from specialist_agents import LabSpecialist, NoteSpecialist, PharmacySpecialist, HistorySpecialist
 
@@ -32,9 +32,12 @@ class DoctorAgent:
         X_context = df[CONTEXT_COLS].fillna(0)
         
         print("\n--- PHASE 1: SPECIALIST TRAINING ---")
-        # Labs
+        # Labs - only numeric columns (exclude text, context, IDs, and any string columns)
         drop_cols = TEXT_COLS + CONTEXT_COLS + ID_COLS + [TARGET]
-        X_lab = df.drop(columns=drop_cols, errors='ignore').fillna(0)
+        X_lab = df.drop(columns=drop_cols, errors='ignore')
+        # Select only numeric columns to avoid string columns like 'curr_service'
+        X_lab = X_lab.select_dtypes(include=[np.number]).fillna(0)
+        print(f"  Lab features: {X_lab.shape[1]} numeric columns")
         self.spec_lab.learn(X_lab, X_context, y)
         
         # Others
@@ -73,7 +76,9 @@ class DoctorAgent:
         
         # Get Opinions
         drop_cols = TEXT_COLS + CONTEXT_COLS + ID_COLS + [TARGET]
-        X_lab = df.drop(columns=drop_cols, errors='ignore').fillna(0)
+        X_lab = df.drop(columns=drop_cols, errors='ignore')
+        # Select only numeric columns to avoid string columns like 'curr_service'
+        X_lab = X_lab.select_dtypes(include=[np.number]).fillna(0)
         
         op_lab = self.spec_lab.give_opinion(X_lab, X_context)
         op_note = self.spec_note.give_opinion(df['clinical_text'].fillna(""), X_context)
@@ -96,35 +101,39 @@ class DoctorAgent:
         return final_probs
 
     def perform_autopsy(self, y_true, y_pred_prob, op_lab, op_note, op_pharm, op_hist):
-        print("\n🔎 PERFORMING AUTOPSY ON PREDICTIONS...")
-        print(f"   Using Calibrated Threshold: {self.optimal_threshold:.4f}")
+        print("\n🔎 FINAL PERFORMANCE REPORT...")
         
-        # Use the SMART threshold, not 0.5
+        # Use the optimized threshold
         y_pred = (y_pred_prob > self.optimal_threshold).astype(int)
         
-        errors = np.where(y_pred != y_true)[0]
-        print(f"   Found {len(errors)} errors out of {len(y_true)} patients.")
+        # 1. METRICS THAT MATTER
+        auc = roc_auc_score(y_true, y_pred_prob)
+        recall = recall_score(y_true, y_pred)     # How many readmissions did we catch?
+        precision = precision_score(y_true, y_pred) # When we flagged risk, were we right?
+        f1 = f1_score(y_true, y_pred)             # Balance of both
         
-        if len(errors) == 0: return
-
-        print(f"   Analyzing first 5 failures:")
-        for idx in errors[:5]:
-            truth = "Readmitted" if y_true[idx] == 1 else "Healthy"
-            doc_guess = "Readmitted" if y_pred[idx] == 1 else "Healthy"
-            
-            print(f"\n   ⚠️ Patient #{idx} | Truth: {truth} | Doctor Said: {doc_guess} (Risk: {y_pred_prob[idx]:.2f})")
-            # We check against the threshold, not 0.5
-            print(f"      - Lab Agent:  {op_lab[idx]:.2f}")
-            print(f"      - Note Agent: {op_note[idx]:.2f}")
-            print(f"      - Pharm Agent:{op_pharm[idx]:.2f}")
-            print(f"      - Hist Agent: {op_hist[idx]:.2f}")
-            
-        print("\n   🏆 DOCTOR'S TRUST MATRIX (What matters most?):")
-        imps = self.brain.feature_importances_
-        # Match features to importance
-        feats = ['Lab_Opinion', 'Note_Opinion', 'Pharm_Opinion', 'Hist_Opinion', 'Age', 'Gender', 'Prior_Visits', 'LOS']
-        for f, i in zip(feats, imps):
-            print(f"      - {f}: {i:.4f}")
+        print(f"   🏆 AUC-ROC:   {auc:.4f} (Primary Metric)")
+        print(f"   🎯 Recall:    {recall:.4f} (Did we catch the sick patients?)")
+        print(f"   🎯 Precision: {precision:.4f} (Did we cry wolf too often?)")
+        print(f"   ⚖️ F1-Score:  {f1:.4f}")
+        
+        # 2. Confusion Matrix
+        cm = confusion_matrix(y_true, y_pred)
+        print("\n   🏥 Clinical Impact Matrix:")
+        print(f"      [ True Neg (Safe) | False Pos (Over-alert) ]")
+        print(f"      [ {cm[0,0]:<13} | {cm[0,1]:<18} ]")
+        print(f"      ------------------------------------------")
+        print(f"      [ {cm[1,0]:<13} | {cm[1,1]:<18} ]")
+        print(f"      [ False Neg (Missed!) | True Pos (Caught!) ]")
+        
+        # 3. Agent Reliability (Correlation with Truth)
+        # Which agent is most correlated with the actual outcome?
+        print("\n   🕵️ AGENT CORRELATION (Who knows the truth?):")
+        # Pearson correlation
+        print(f"      Lab Agent:     {np.corrcoef(op_lab, y_true)[0,1]:.4f}")
+        print(f"      Note Agent:    {np.corrcoef(op_note, y_true)[0,1]:.4f}")
+        print(f"      Pharm Agent:   {np.corrcoef(op_pharm, y_true)[0,1]:.4f}")
+        print(f"      History Agent: {np.corrcoef(op_hist, y_true)[0,1]:.4f}")
 
 if __name__ == "__main__":
     try:

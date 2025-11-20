@@ -11,7 +11,7 @@ warnings.filterwarnings('ignore')
 
 # --- CONFIGURATION ---
 BASE_PATH = 'D:/Parizad/PHD/Project/Data/mimic-iv-2.2/'
-OUTPUT_FILE = './model_outputs/features_4_agents.csv'
+OUTPUT_FILE = './model_outputs/features_4_agents_augmented.csv'
 CHUNK_SIZE = 500000 
 
 FILE_PATHS = {
