@@ -1,8 +1,9 @@
 import numpy as np
 import pandas as pd
+import re
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.feature_extraction.text import TfidfVectorizer  # CHANGED from CountVectorizer
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sentence_transformers import SentenceTransformer
 from sklearn.preprocessing import StandardScaler
 
@@ -23,7 +24,7 @@ class ContextFusion:
         return np.column_stack((features, context_scaled))
 
 # ==========================================
-# 1. LAB SPECIALIST (Numeric Expert)
+# 1. LAB SPECIALIST
 # ==========================================
 class LabSpecialist:
     def __init__(self):
@@ -42,44 +43,87 @@ class LabSpecialist:
         return self.model.predict_proba(X_final)[:, 1]
 
 # ==========================================
-# 2. NOTE SPECIALIST (Semantic Expert)
+# 2. NOTE SPECIALIST (Risk Highlighter + Hybrid)
 # ==========================================
 class NoteSpecialist:
     def __init__(self):
         self.name = "Spec_Notes"
-        # Use a slightly larger model if GPU available, otherwise keep MiniLM
-        self.encoder = SentenceTransformer('all-MiniLM-L6-v2')
-        self.model = LogisticRegression(class_weight='balanced', max_iter=1000)
+        # ClinicalBERT is good, but we need to force it to see "Risk"
+        self.encoder = SentenceTransformer('pritamdeka/S-PubMedBert-MS-MARCO')
+        self.model = LogisticRegression(class_weight='balanced', max_iter=2000)
         self.fusion = ContextFusion()
+        
+        # HIGH-RISK KEYWORDS (The "Red Flags")
+        self.risk_lexicon = [
+            r'non.?complian', r'refus', r'against medical advice', r' ama ', 
+            r'homeless', r'shelter', r'undomiciled', r'substance', r'alcohol', r'etoh',
+            r'unstable', r'frail', r'dementia', r'fall', r'metast', r'hospice', 
+            r'palliative', r'poor prognosis', r'severe', r'critical'
+        ]
 
-    def _preprocess(self, text_list):
-        # FIX: Take the LAST 2000 chars (Discharge instructions/Plan), not the first.
-        # If text is shorter than 2000, it takes the whole thing.
-        return [str(t)[-2000:] for t in text_list]
+    def _preprocess(self, text_list, train_mode=False):
+        cleaned_text = []
+        risk_scores = []
+        
+        for i, t in enumerate(text_list):
+            s = str(t).lower()
+            
+            # 1. Calculate Explicit Risk Score (Count the Red Flags)
+            score = 0
+            for pattern in self.risk_lexicon:
+                if re.search(pattern, s):
+                    score += 1
+            risk_scores.append(score)
+
+            # 2. Smart Extraction: Grab the "Assessment" OR "Discharge" OR "Plan"
+            # If Regex fails, we take the 'Risk Sentences' + Last 1000 chars
+            match = re.search(r'(?:assessment|impression|plan|discharge instructions)([\s\S]*?)(?:signed|dictated|\Z)', s)
+            
+            if match and len(match.group(1)) > 50:
+                extracted = match.group(1).strip()
+            else:
+                # FALLBACK: Take the last 1000 chars
+                extracted = s[-1000:]
+            
+            # Prepend the risk score so BERT "sees" it immediately
+            final_text = f"[RISK_SCORE: {score}] {extracted[:1500]}" 
+            cleaned_text.append(final_text)
+            
+            # DEBUG: Print the first one so we can see what it found
+            if train_mode and i == 0:
+                print(f"\n   🕵️ [DEBUG] Note Agent is reading this (Sample 1):\n   '{final_text[:200]}...'\n")
+
+        return cleaned_text, np.array(risk_scores).reshape(-1, 1)
 
     def learn(self, text_list, context, y):
-        print(f"   📖 [{self.name}] Learning from Notes (Discharge Plan Focus)...")
+        print(f"   📖 [{self.name}] Learning (ClinicalBERT + Risk Lexicon)...")
         self.fusion.fit(context)
         
-        processed_text = self._preprocess(text_list)
-        embeds = self.encoder.encode(processed_text, batch_size=64, show_progress_bar=True)
+        processed_text, risk_scores = self._preprocess(text_list, train_mode=True)
+        embeds = self.encoder.encode(processed_text, batch_size=32, show_progress_bar=True)
         
-        X_final = self.fusion.merge(embeds, context)
+        # Merge: BERT Embeddings + Risk Score + Context
+        # We inject the Risk Score as an explicit feature alongside the embedding
+        X_augmented = np.column_stack([embeds, risk_scores])
+        X_final = self.fusion.merge(X_augmented, context)
+        
         self.model.fit(X_final, y)
 
     def give_opinion(self, text_list, context):
-        processed_text = self._preprocess(text_list)
-        embeds = self.encoder.encode(processed_text, batch_size=64)
-        X_final = self.fusion.merge(embeds, context)
+        processed_text, risk_scores = self._preprocess(text_list)
+        embeds = self.encoder.encode(processed_text, batch_size=32)
+        
+        X_augmented = np.column_stack([embeds, risk_scores])
+        X_final = self.fusion.merge(X_augmented, context)
+        
         return self.model.predict_proba(X_final)[:, 1]
 
 # ==========================================
-# 3. PHARMACY SPECIALIST (Keyword Expert)
+# 3. PHARMACY SPECIALIST
 # ==========================================
 class PharmacySpecialist:
     def __init__(self):
         self.name = "Spec_Pharm"
-        # CHANGE: TF-IDF captures "rare" drugs (often for severe conditions) better than counts
         self.vectorizer = TfidfVectorizer(max_features=800, stop_words='english')
         self.model = LogisticRegression(class_weight='balanced', solver='liblinear', max_iter=1000)
         self.fusion = ContextFusion()
@@ -97,13 +141,11 @@ class PharmacySpecialist:
         return self.model.predict_proba(X_final)[:, 1]
 
 # ==========================================
-# 4. HISTORY SPECIALIST (Keyword Expert)
+# 4. HISTORY SPECIALIST
 # ==========================================
 class HistorySpecialist:
     def __init__(self):
         self.name = "Spec_Hist"
-        # CHANGE: Increased features to 1500 to capture more specific ICD codes
-        # CHANGE: TF-IDF downweights common codes (e.g., "Hypertension") to focus on specific comorbidities
         self.vectorizer = TfidfVectorizer(max_features=1500)
         self.model = LogisticRegression(class_weight='balanced', solver='liblinear', max_iter=1000)
         self.fusion = ContextFusion()
