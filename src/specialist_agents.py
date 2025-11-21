@@ -62,6 +62,12 @@ class NoteSpecialist:
         ]
 
     def _preprocess(self, text_list, train_mode=False):
+        # Ensure text_list is a list/array, not a pandas Series
+        if hasattr(text_list, 'tolist'):
+            text_list = text_list.tolist()
+        elif hasattr(text_list, 'values'):
+            text_list = text_list.values.tolist()
+        
         cleaned_text = []
         risk_scores = []
         
@@ -111,7 +117,8 @@ class NoteSpecialist:
 
     def give_opinion(self, text_list, context):
         processed_text, risk_scores = self._preprocess(text_list)
-        embeds = self.encoder.encode(processed_text, batch_size=32)
+        # Show progress bar when encoding (this is the slow part)
+        embeds = self.encoder.encode(processed_text, batch_size=32, show_progress_bar=True)
         
         X_augmented = np.column_stack([embeds, risk_scores])
         X_final = self.fusion.merge(X_augmented, context)

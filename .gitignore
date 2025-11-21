@@ -34,11 +34,12 @@ data/
 *.hdf5
 
 # Model outputs
-model_outputs/
-*.pkl
-*.joblib
-*.h5
-*.ckpt
+model_outputs/*.csv
+model_outputs/*.pkl
+model_outputs/*.h5
+model_outputs/*.ckpt
+# But keep the saved_models directory structure (just ignore the files)
+model_outputs/saved_models/*.joblib
 
 # IDE
 .vscode/
