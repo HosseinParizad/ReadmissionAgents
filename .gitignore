@@ -10,3 +10,4 @@ share/
 shared/
 output/
 outputs/
+catboost_info/
