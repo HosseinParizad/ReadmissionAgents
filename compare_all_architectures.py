@@ -74,21 +74,97 @@ from sklearn.metrics import roc_curve, precision_recall_curve
 from sklearn.calibration import IsotonicRegression, calibration_curve
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
-from catboost import CatBoostClassifier
-from lightgbm import LGBMClassifier
-from xgboost import XGBClassifier
+
+# =============================================================================
+# STRICT DEPENDENCY CHECKING - NO FALLBACKS
+# =============================================================================
+print("=" * 70)
+print("CHECKING DEPENDENCIES (STRICT MODE)")
+print("=" * 70)
+
+# Check CatBoost
+try:
+    from catboost import CatBoostClassifier
+    print("   ✅ CatBoost loaded successfully")
+except ImportError as e:
+    raise ImportError(f"❌ REQUIRED: CatBoost not installed!\n   Install with: pip install catboost\n   Error: {e}")
+
+# Check LightGBM
+try:
+    from lightgbm import LGBMClassifier
+    print("   ✅ LightGBM loaded successfully")
+except ImportError as e:
+    raise ImportError(f"❌ REQUIRED: LightGBM not installed!\n   Install with: pip install lightgbm\n   Error: {e}")
+
+# Check XGBoost
+try:
+    from xgboost import XGBClassifier
+    print("   ✅ XGBoost loaded successfully")
+except ImportError as e:
+    raise ImportError(f"❌ REQUIRED: XGBoost not installed!\n   Install with: pip install xgboost\n   Error: {e}")
+
+# Check PyTorch
+try:
+    import torch
+    CUDA_AVAILABLE = torch.cuda.is_available()
+    DEVICE = "cuda" if CUDA_AVAILABLE else "cpu"
+    if CUDA_AVAILABLE:
+        print(f"   ✅ PyTorch loaded successfully (GPU: {torch.cuda.get_device_name(0)})")
+    else:
+        print(f"   ✅ PyTorch loaded successfully (CPU mode - this will be slower)")
+except ImportError as e:
+    raise ImportError(f"❌ REQUIRED: PyTorch not installed!\n   Install with: pip install torch\n   Error: {e}")
+
+# Check SentenceTransformers
+try:
+    from sentence_transformers import SentenceTransformer
+    print("   ✅ SentenceTransformers loaded successfully")
+except ImportError as e:
+    raise ImportError(f"❌ REQUIRED: sentence-transformers not installed!\n   Install with: pip install sentence-transformers\n   Error: {e}")
+
 import warnings
 warnings.filterwarnings('ignore')
 
 # Import from existing codebase
-from config import (
-    DATA_PATH, TARGET, RANDOM_STATE, USE_TEMPORAL_SPLIT,
-    DOCTOR_CONTEXT_FEATURES, DEFAULT_N_FOLDS, CATBOOST_PARAMS
-)
-from specialist_agents import (
-    LabSpecialist, NoteSpecialist, PharmacySpecialist,
-    HistorySpecialist, PsychosocialSpecialist
-)
+print("\n   Loading project modules...")
+
+try:
+    from config import (
+        DATA_PATH, TARGET, RANDOM_STATE, USE_TEMPORAL_SPLIT,
+        DOCTOR_CONTEXT_FEATURES, DEFAULT_N_FOLDS, CATBOOST_PARAMS
+    )
+    print("   ✅ config.py loaded successfully")
+except ImportError as e:
+    raise ImportError(f"❌ REQUIRED: config.py not found!\n   Ensure config.py is in your project directory.\n   Error: {e}")
+
+try:
+    from specialist_agents import (
+        LabSpecialist, NoteSpecialist, PharmacySpecialist,
+        HistorySpecialist, PsychosocialSpecialist
+    )
+    print("   ✅ specialist_agents.py loaded successfully")
+except ImportError as e:
+    raise ImportError(f"❌ REQUIRED: specialist_agents.py not found or has errors!\n   Ensure specialist_agents.py is in your project directory.\n   Error: {e}")
+
+# Check for clinicalbert_cache (required by specialist_agents)
+try:
+    from clinicalbert_cache import ClinicalBERTCache
+    print("   ✅ clinicalbert_cache.py loaded successfully")
+except ImportError as e:
+    raise ImportError(f"❌ REQUIRED: clinicalbert_cache.py not found!\n   Ensure clinicalbert_cache.py is in your project directory.\n   Error: {e}")
+
+# Check for protective_factors (optional but recommended)
+try:
+    from protective_factors import extract_protective_factors
+    print("   ✅ protective_factors.py loaded successfully")
+    HAS_PROTECTIVE_FACTORS = True
+except ImportError:
+    print("   ⚠️ protective_factors.py not found (optional, continuing without it)")
+    HAS_PROTECTIVE_FACTORS = False
+
+print("\n" + "=" * 70)
+print("ALL DEPENDENCIES VERIFIED - STARTING COMPARISON")
+print("=" * 70)
 
 # =============================================================================
 # CONFIGURATION
@@ -1164,7 +1240,9 @@ def run_full_comparison(arch_nums: List[int], skip_specialist_training: bool = F
         name, func = arch_funcs[arch_num]
         print(f"\nRunning Architecture {arch_num}: {name}...")
         try:
-            if arch_num in [0, 6]:  # These need original dataframes
+            if arch_num == 0:
+                results = func(train_oof, test_oof, train_ctx, test_ctx, df_train)
+            elif arch_num == 6:
                 results = func(train_oof, test_oof, train_ctx, test_ctx, df_train, df_test)
             else:
                 results = func(train_oof, test_oof, train_ctx, test_ctx)

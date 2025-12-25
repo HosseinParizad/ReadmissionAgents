@@ -7,3 +7,4 @@ lightgbm
 xgboost
 torch
 transformers
+sentence-transformers
