@@ -414,11 +414,11 @@ class NoteSpecialist:
         cleaned_texts = [self._clean_text_for_lda(t) for t in texts]
         
         self.count_vectorizer = CountVectorizer(
-            max_features=2000,
-            min_df=5,
-            max_df=0.8,
+            max_features=1000,  # Reduced for performance
+            min_df=50,  # Increased to reduce vocabulary on large datasets
+            max_df=0.7,  # More aggressive filtering
             stop_words='english',
-            ngram_range=(1, 2)
+            ngram_range=(1, 1)  # Unigrams only for speed
         )
         
         doc_term_matrix = self.count_vectorizer.fit_transform(cleaned_texts)
