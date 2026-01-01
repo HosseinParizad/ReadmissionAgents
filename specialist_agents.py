@@ -36,10 +36,34 @@ import pandas as pd
 import re
 from tqdm import tqdm
 import os
+import gc
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import LatentDirichletAllocation
+
+# Memory monitoring (optional - install psutil if needed)
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+
+def print_memory_usage(stage: str = ""):
+    """Print current memory usage."""
+    if HAS_PSUTIL:
+        mem = psutil.virtual_memory()
+        print(f"      [MEM] {stage} - RAM: {mem.percent:.1f}% ({mem.used/1e9:.1f}/{mem.total/1e9:.1f} GB)")
+    # Don't print if psutil not available to avoid clutter
+
+# =============================================================================
+# FIX WINDOWS CONSOLE ENCODING FOR UNICODE CHARACTERS
+# =============================================================================
+import sys
+if sys.platform == 'win32':
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 # =============================================================================
 # STRICT DEPENDENCY CHECKING - NO FALLBACKS
@@ -60,9 +84,30 @@ except ImportError as e:
 try:
     import torch
     from sentence_transformers import SentenceTransformer
+    
+    # Enhanced GPU detection
     CUDA_AVAILABLE = torch.cuda.is_available()
-    DEVICE = "cuda" if CUDA_AVAILABLE else "cpu"
-    print(f"      ✅ PyTorch loaded successfully (Device: {DEVICE})")
+    if CUDA_AVAILABLE:
+        # Verify GPU is actually accessible
+        try:
+            torch.cuda.device_count()
+            torch.cuda.get_device_name(0)
+            DEVICE = "cuda"
+            print(f"      ✅ PyTorch loaded successfully (Device: {DEVICE})")
+            print(f"      ✅ GPU available: {torch.cuda.get_device_name(0)}")
+            print(f"      ✅ CUDA version: {torch.version.cuda}")
+        except Exception as e:
+            print(f"      ⚠️ GPU detected but not accessible: {e}")
+            DEVICE = "cpu"
+            print(f"      ⚠️ Falling back to CPU")
+    else:
+        DEVICE = "cpu"
+        print(f"      ✅ PyTorch loaded successfully (Device: {DEVICE})")
+        print(f"      ⚠️ WARNING: No GPU detected - running on CPU (this will be slower)")
+        print(f"      💡 To use GPU, ensure:")
+        print(f"         1. NVIDIA GPU with CUDA support is installed")
+        print(f"         2. CUDA drivers are installed")
+        print(f"         3. PyTorch with CUDA is installed: pip install torch --index-url https://download.pytorch.org/whl/cu118")
 except ImportError as e:
     raise ImportError(
         "❌ REQUIRED: torch and sentence-transformers not installed!\n"
@@ -70,18 +115,12 @@ except ImportError as e:
         f"   Original error: {e}"
     )
 
-# Verify GPU availability
-if CUDA_AVAILABLE:
-    print(f"      ✅ GPU available: {torch.cuda.get_device_name(0)}")
-else:
-    print(f"      ⚠️ WARNING: Running on CPU - this will be slower")
-
 # Import centralized configuration
 from config import RANDOM_STATE
 
 # Constants - OPTIMIZED REGULARIZATION
 DEFAULT_LEARNING_RATE = 0.02      # Slightly slower for better generalization
-DEFAULT_MAX_ITER = 500            # More iterations
+DEFAULT_MAX_ITER = 200            # Reduced for faster training (was 500, too slow on large datasets)
 DEFAULT_MAX_DEPTH = 4             # Shallower to prevent overfitting
 DEFAULT_MIN_SAMPLES_LEAF = 100    # Larger leaves for robustness
 DEFAULT_L2_REGULARIZATION = 3.0   # Stronger L2
@@ -179,7 +218,11 @@ class LabSpecialist:
             min_samples_leaf=DEFAULT_MIN_SAMPLES_LEAF,
             l2_regularization=DEFAULT_L2_REGULARIZATION,
             class_weight='balanced',
-            random_state=RANDOM_STATE
+            random_state=RANDOM_STATE,
+            early_stopping=True,
+            validation_fraction=0.1,
+            n_iter_no_change=15,
+            tol=1e-7
         )
         self.scaler = StandardScaler()
         self.feature_names: List[str] = []
@@ -348,9 +391,10 @@ class NoteSpecialist:
         )
         print(f"      ✅ NoteSpecialist: ClinicalBERT on {DEVICE.upper()}")
         
-        # Initialize cache (REQUIRED)
-        self.cache = ClinicalBERTCache()
-        print(f"      ✅ NoteSpecialist: ClinicalBERT cache enabled")
+        # Initialize cache (REQUIRED) - limit to 100K embeddings to prevent memory issues
+        # The cache file persists, but in-memory cache is limited
+        self.cache = ClinicalBERTCache(max_cache_size=100000)
+        print(f"      ✅ NoteSpecialist: ClinicalBERT cache enabled (max 100K in-memory)")
         
         self.model = HistGradientBoostingClassifier(
             learning_rate=DEFAULT_LEARNING_RATE,
@@ -359,7 +403,11 @@ class NoteSpecialist:
             min_samples_leaf=DEFAULT_MIN_SAMPLES_LEAF,
             l2_regularization=DEFAULT_L2_REGULARIZATION,
             class_weight='balanced',
-            random_state=RANDOM_STATE
+            random_state=RANDOM_STATE,
+            early_stopping=True,
+            validation_fraction=0.1,
+            n_iter_no_change=15,
+            tol=1e-7
         )
         self.scaler = StandardScaler()
         self.manual_feature_names: List[str] = []
@@ -409,10 +457,17 @@ class NoteSpecialist:
     
     def _fit_lda(self, texts: List[str]) -> None:
         """Fit LDA topic model on training texts."""
-        print(f"      Fitting LDA topic model ({LDA_N_TOPICS} topics)...")
+        import time
         
-        cleaned_texts = [self._clean_text_for_lda(t) for t in texts]
+        # Clean texts with progress
+        print(f"               Cleaning {len(texts):,} texts for LDA...")
+        t0 = time.time()
+        cleaned_texts = [self._clean_text_for_lda(t) for t in tqdm(texts, desc="Cleaning", unit="text", leave=False)]
+        print(f"               ✓ Text cleaning took {time.time()-t0:.1f}s")
         
+        # Build vocabulary
+        print(f"               Building vocabulary (max_features=1000)...")
+        t0 = time.time()
         self.count_vectorizer = CountVectorizer(
             max_features=1000,  # Reduced for performance
             min_df=50,  # Increased to reduce vocabulary on large datasets
@@ -422,23 +477,38 @@ class NoteSpecialist:
         )
         
         doc_term_matrix = self.count_vectorizer.fit_transform(cleaned_texts)
+        vocab_size = len(self.count_vectorizer.vocabulary_)
+        print(f"               ✓ Vocabulary built: {vocab_size} terms, took {time.time()-t0:.1f}s")
         
+        # Fit LDA model
+        print(f"               Fitting LDA ({LDA_N_TOPICS} topics, {LDA_MAX_ITER} iterations)...")
+        t0 = time.time()
         self.lda = LatentDirichletAllocation(
             n_components=LDA_N_TOPICS,
             max_iter=LDA_MAX_ITER,
             learning_method='online',
             random_state=RANDOM_STATE,
-            n_jobs=-1
+            n_jobs=-1,
+            verbose=1  # Show LDA fitting progress
         )
         self.lda.fit(doc_term_matrix)
+        print(f"               ✓ LDA model fitted in {time.time()-t0:.1f}s")
         self.lda_fitted = True
     
     def _get_lda_features(self, texts: List[str]) -> np.ndarray:
         """Get LDA topic distribution for texts."""
+        import time
         if not self.lda_fitted:
             return np.zeros((len(texts), LDA_N_TOPICS))
         
-        cleaned_texts = [self._clean_text_for_lda(t) for t in texts]
+        # Clean texts with progress for large datasets
+        t0 = time.time()
+        if len(texts) > 5000:
+            cleaned_texts = [self._clean_text_for_lda(t) for t in tqdm(texts, desc="LDA clean", unit="text", leave=False)]
+        else:
+            cleaned_texts = [self._clean_text_for_lda(t) for t in texts]
+        
+        # Transform to topic distributions
         doc_term_matrix = self.count_vectorizer.transform(cleaned_texts)
         topic_distributions = self.lda.transform(doc_term_matrix)
         
@@ -470,7 +540,10 @@ class NoteSpecialist:
         """Extract interpretable manual features from text."""
         features_list = []
         
-        for text in texts:
+        # Add progress bar for large datasets
+        text_iter = tqdm(texts, desc="Manual features", unit="text", leave=False) if len(texts) > 1000 else texts
+        
+        for text in text_iter:
             text_lower = text.lower() if text else ""
             features = {}
             
@@ -515,79 +588,174 @@ class NoteSpecialist:
         return pd.DataFrame(features_list)
     
     def _get_embeddings_cached(self, texts: List[str]) -> np.ndarray:
-        """Get ClinicalBERT embeddings with caching."""
-        embeddings = []
+        """Get ClinicalBERT embeddings with caching (memory-optimized)."""
+        n_texts = len(texts)
         texts_to_encode = []
         indices_to_encode = []
+        cached_indices = []
+        cached_embeddings = []
         
-        # Check cache first
+        # Check cache first - collect cached and uncached separately
         for i, text in enumerate(texts):
             cached = self.cache.get(text)
             if cached is not None:
-                embeddings.append((i, cached))
+                cached_indices.append(i)
+                cached_embeddings.append(cached)
             else:
                 texts_to_encode.append(text[:512])  # Truncate for BERT
                 indices_to_encode.append(i)
+        
+        # Pre-allocate output array (memory-efficient)
+        if cached_embeddings:
+            embedding_dim = cached_embeddings[0].shape[0]
+        else:
+            # If no cache, we'll get dim from first encoding
+            embedding_dim = 768  # Default ClinicalBERT dimension
+        
+        result = np.zeros((n_texts, embedding_dim), dtype=np.float32)
+        
+        # Fill in cached embeddings
+        for idx, emb in zip(cached_indices, cached_embeddings):
+            result[idx] = emb
         
         # Encode uncached texts
         if texts_to_encode:
             new_embeddings = self.encoder.encode(
                 texts_to_encode,
                 show_progress_bar=True,
-                batch_size=32
+                batch_size=32,
+                convert_to_numpy=True
             )
             
-            for idx, text, emb in zip(indices_to_encode, texts_to_encode, new_embeddings):
+            # Update embedding_dim if needed
+            if new_embeddings.shape[1] != embedding_dim:
+                embedding_dim = new_embeddings.shape[1]
+                # Resize result array if needed
+                if result.shape[1] != embedding_dim:
+                    new_result = np.zeros((n_texts, embedding_dim), dtype=np.float32)
+                    new_result[:, :result.shape[1]] = result[:, :result.shape[1]]
+                    result = new_result
+            
+            # Fill in new embeddings and cache them (optimized batch operation)
+            n_new = len(new_embeddings)
+            
+            # Process with progress bar for better visibility
+            if n_new > 100:
+                print(f"      📦 Caching {n_new:,} new embeddings...")
+                cache_iter = tqdm(
+                    zip(indices_to_encode, texts_to_encode, new_embeddings),
+                    total=n_new,
+                    desc="Caching",
+                    unit="emb",
+                    leave=True
+                )
+            else:
+                cache_iter = zip(indices_to_encode, texts_to_encode, new_embeddings)
+            
+            for idx, text, emb in cache_iter:
+                result[idx] = emb
                 self.cache.set(text, emb)
-                embeddings.append((idx, emb))
         
-        # Sort by original index and extract embeddings
-        embeddings.sort(key=lambda x: x[0])
-        return np.array([e[1] for e in embeddings])
+        return result
     
     def learn(self, texts: List[str], X_context: pd.DataFrame, y: np.ndarray) -> None:
         """Train the note specialist."""
-        # Fit LDA on training texts
+        import time
+        total_start = time.time()
+        
+        # Step 1: Fit LDA on training texts
+        print(f"      [Step 1/6] Fitting LDA topic model...")
+        t0 = time.time()
         self._fit_lda(texts)
+        print(f"               ✓ LDA fitting took {time.time()-t0:.1f}s")
         
-        # Get ClinicalBERT embeddings
-        print(f"      Encoding {len(texts):,} texts with ClinicalBERT...")
+        # Step 2: Get ClinicalBERT embeddings
+        print(f"      [Step 2/6] Encoding {len(texts):,} texts with ClinicalBERT...")
+        print_memory_usage("Before encoding")
+        t0 = time.time()
         embeddings = self._get_embeddings_cached(texts)
+        print(f"               ✓ Encoding took {time.time()-t0:.1f}s")
+        print_memory_usage("After encoding")
+        gc.collect()  # Free memory from encoding process
         
-        # Get LDA features
+        # Step 3: Get LDA features
+        print(f"      [Step 3/6] Extracting LDA topic features for {len(texts):,} texts...")
+        t0 = time.time()
         lda_features = self._get_lda_features(texts)
+        print(f"               ✓ LDA extraction took {time.time()-t0:.1f}s")
+        gc.collect()
         
-        # Get manual features
+        # Step 4: Get manual features
+        print(f"      [Step 4/6] Extracting {len(texts):,} manual keyword features...")
+        t0 = time.time()
         manual_features = self._extract_manual_features(texts)
+        print(f"               ✓ Manual extraction took {time.time()-t0:.1f}s")
+        gc.collect()
         self.manual_feature_names = manual_features.columns.tolist()
         
-        # Combine all features
+        # Step 5: Combine all features
+        print(f"      [Step 5/6] Combining features (BERT:{embeddings.shape[1]} + LDA:{lda_features.shape[1]} + Manual:{len(manual_features.columns)})...")
+        t0 = time.time()
+        
         X_combined = np.hstack([
             embeddings,
             lda_features,
             manual_features.fillna(0).values
         ])
+        print(f"               ✓ Feature combination took {time.time()-t0:.1f}s → {X_combined.shape[1]} total features")
         
+        # Step 6: Scale and train model
+        print(f"      [Step 6/6] Scaling and training HistGradientBoostingClassifier on {len(y):,} samples...")
+        t0 = time.time()
         X_scaled = self.scaler.fit_transform(X_combined)
+        print(f"               ✓ Scaling took {time.time()-t0:.1f}s")
+        
+        t0 = time.time()
+        print(f"               Training model (this may take 5-15 minutes)...")
         self.model.fit(X_scaled, y)
+        print(f"               ✓ Model training took {(time.time()-t0)/60:.1f} minutes")
         self.is_fitted = True
         
-        print(f"      ✅ NoteSpecialist trained with {X_combined.shape[1]} features "
+        # Save cache after successful training
+        try:
+            self.cache.save()
+            print(f"      [CACHE] Saved {len(self.cache.cache)} embeddings to cache")
+        except Exception as e:
+            print(f"      [CACHE] Warning: Failed to save cache: {e}")
+        
+        total_time = time.time() - total_start
+        print(f"      ✅ NoteSpecialist trained in {total_time/60:.1f} min with {X_combined.shape[1]} features "
               f"({embeddings.shape[1]} BERT + {lda_features.shape[1]} LDA + {len(self.manual_feature_names)} manual)")
     
     def give_opinion(self, texts: List[str], X_context: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
         """Generate probability predictions."""
+        import time
         if not self.is_fitted:
             raise RuntimeError("NoteSpecialist must be trained before giving opinions!")
         
+        n_texts = len(texts)
+        show_progress = n_texts > 5000
+        
+        if show_progress:
+            print(f"      [NoteSpecialist] Processing {n_texts:,} texts for inference...")
+        
         # Get embeddings
+        t0 = time.time()
         embeddings = self._get_embeddings_cached(texts)
+        if show_progress:
+            print(f"               ✓ Embeddings: {time.time()-t0:.1f}s")
         
         # Get LDA features
+        t0 = time.time()
         lda_features = self._get_lda_features(texts)
+        if show_progress:
+            print(f"               ✓ LDA features: {time.time()-t0:.1f}s")
         
         # Get manual features
+        t0 = time.time()
         manual_features = self._extract_manual_features(texts)
+        if show_progress:
+            print(f"               ✓ Manual features: {time.time()-t0:.1f}s")
         
         # Combine
         X_combined = np.hstack([
@@ -647,7 +815,11 @@ class PharmacySpecialist:
             min_samples_leaf=DEFAULT_MIN_SAMPLES_LEAF,
             l2_regularization=DEFAULT_L2_REGULARIZATION,
             class_weight='balanced',
-            random_state=RANDOM_STATE
+            random_state=RANDOM_STATE,
+            early_stopping=True,
+            validation_fraction=0.1,
+            n_iter_no_change=15,
+            tol=1e-7
         )
         self.scaler = StandardScaler()
         self.manual_feature_names: List[str] = []
@@ -746,7 +918,11 @@ class HistorySpecialist:
             min_samples_leaf=DEFAULT_MIN_SAMPLES_LEAF,
             l2_regularization=DEFAULT_L2_REGULARIZATION,
             class_weight='balanced',
-            random_state=RANDOM_STATE
+            random_state=RANDOM_STATE,
+            early_stopping=True,
+            validation_fraction=0.1,
+            n_iter_no_change=15,
+            tol=1e-7
         )
         self.scaler = StandardScaler()
         self.is_fitted = False
@@ -848,7 +1024,11 @@ class PsychosocialSpecialist:
             min_samples_leaf=DEFAULT_MIN_SAMPLES_LEAF,
             l2_regularization=DEFAULT_L2_REGULARIZATION,
             class_weight='balanced',
-            random_state=RANDOM_STATE
+            random_state=RANDOM_STATE,
+            early_stopping=True,
+            validation_fraction=0.1,
+            n_iter_no_change=15,
+            tol=1e-7
         )
         
         self.care_model = HistGradientBoostingClassifier(
@@ -858,7 +1038,11 @@ class PsychosocialSpecialist:
             min_samples_leaf=DEFAULT_MIN_SAMPLES_LEAF,
             l2_regularization=DEFAULT_L2_REGULARIZATION,
             class_weight='balanced',
-            random_state=RANDOM_STATE
+            random_state=RANDOM_STATE,
+            early_stopping=True,
+            validation_fraction=0.1,
+            n_iter_no_change=15,
+            tol=1e-7
         )
         
         self.social_model = HistGradientBoostingClassifier(
@@ -868,7 +1052,11 @@ class PsychosocialSpecialist:
             min_samples_leaf=DEFAULT_MIN_SAMPLES_LEAF,
             l2_regularization=DEFAULT_L2_REGULARIZATION,
             class_weight='balanced',
-            random_state=RANDOM_STATE
+            random_state=RANDOM_STATE,
+            early_stopping=True,
+            validation_fraction=0.1,
+            n_iter_no_change=15,
+            tol=1e-7
         )
         
         # Meta-model combines sub-specialists
@@ -879,7 +1067,11 @@ class PsychosocialSpecialist:
             min_samples_leaf=DEFAULT_MIN_SAMPLES_LEAF,
             l2_regularization=DEFAULT_L2_REGULARIZATION,
             class_weight='balanced',
-            random_state=RANDOM_STATE
+            random_state=RANDOM_STATE,
+            early_stopping=True,
+            validation_fraction=0.1,
+            n_iter_no_change=15,
+            tol=1e-7
         )
         
         self.scalers = {

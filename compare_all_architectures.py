@@ -65,6 +65,7 @@ import pickle
 import argparse
 import numpy as np
 import pandas as pd
+import gc
 from datetime import datetime
 from typing import Dict, Tuple, List, Optional
 from sklearn.model_selection import train_test_split, StratifiedKFold
@@ -74,6 +75,14 @@ from sklearn.metrics import roc_curve, precision_recall_curve
 from sklearn.calibration import IsotonicRegression, calibration_curve
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
+
+# =============================================================================
+# FIX WINDOWS CONSOLE ENCODING FOR UNICODE CHARACTERS
+# =============================================================================
+if sys.platform == 'win32':
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 # =============================================================================
 # STRICT DEPENDENCY CHECKING - NO FALLBACKS
@@ -215,6 +224,44 @@ ARCHITECTURE_NAMES = {
 
 
 # =============================================================================
+# GPU CONFIGURATION FOR GRADIENT BOOSTING
+# =============================================================================
+def get_gpu_params():
+    """
+    Returns GPU parameters for CatBoost, LightGBM, and XGBoost if GPU is available.
+    Falls back to CPU if GPU is not available.
+    """
+    gpu_params = {}
+    
+    # Check if CUDA is available
+    try:
+        import torch
+        if torch.cuda.is_available():
+            # CatBoost GPU
+            gpu_params['catboost'] = {'task_type': 'GPU', 'devices': '0'}
+            # LightGBM GPU
+            gpu_params['lightgbm'] = {'device': 'gpu', 'gpu_platform_id': 0, 'gpu_device_id': 0}
+            # XGBoost GPU (XGBoost 3.1+ uses 'device' parameter)
+            gpu_params['xgboost'] = {'device': 'cuda:0'}
+            return gpu_params
+    except:
+        pass
+    
+    # Default to CPU
+    gpu_params['catboost'] = {}
+    gpu_params['lightgbm'] = {}
+    gpu_params['xgboost'] = {}
+    return gpu_params
+
+# Get GPU parameters once at module load
+GPU_PARAMS = get_gpu_params()
+if GPU_PARAMS['catboost']:
+    print(f"   ✅ GPU acceleration enabled for gradient boosting models")
+else:
+    print(f"   ℹ️  Gradient boosting models will use CPU (GPU not available)")
+
+
+# =============================================================================
 # SPECIALIST CALIBRATOR (from train_model.py)
 # =============================================================================
 class SpecialistCalibrator:
@@ -333,6 +380,30 @@ def train_specialists_and_save_oof(df_train: pd.DataFrame, df_test: pd.DataFrame
         oof_train['psych_care'][fold_val_idx] = psych_sub['care']
         oof_train['psych_social'][fold_val_idx] = psych_sub['social']
         print(f"AUC: {roc_auc_score(y_train[fold_val_idx], op_psych):.4f}")
+        
+        # === MEMORY CLEANUP BETWEEN FOLDS ===
+        print(f"       🧹 Cleaning up fold {fold_idx + 1} memory...")
+        # Delete specialist objects (they hold large models and embeddings)
+        del spec_lab, spec_note, spec_pharm, spec_hist, spec_psych
+        # Delete fold-specific data
+        del df_fold_train, df_fold_val, y_fold_train
+        del X_ctx_train, X_ctx_val, X_labs_train, X_labs_val
+        del op_lab, op_note, op_pharm, op_hist, op_psych, psych_sub
+        # Force garbage collection
+        gc.collect()
+        # Clear GPU cache if available
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except:
+            pass
+        # Print memory status
+        try:
+            import psutil
+            mem = psutil.virtual_memory()
+            print(f"       [MEM] After cleanup: {mem.percent:.1f}% ({mem.used/1e9:.1f}/{mem.total/1e9:.1f} GB)")
+        except:
+            pass
     
     # Report overall OOF AUC
     print(f"\n   📊 Overall OOF AUC (Training Set):")
@@ -624,7 +695,8 @@ def run_arch0_baseline(train_oof, test_oof, train_ctx, test_ctx, df_train=None):
     cat_model = CatBoostClassifier(
         iterations=2000, learning_rate=0.01, depth=6,
         l2_leaf_reg=8, min_data_in_leaf=30,
-        early_stopping_rounds=200, verbose=0, random_seed=RANDOM_STATE
+        early_stopping_rounds=200, verbose=0, random_seed=RANDOM_STATE,
+        **GPU_PARAMS['catboost']
     )
     cat_model.fit(X_tr, y_tr, eval_set=(X_val, y_val))
     
@@ -632,7 +704,8 @@ def run_arch0_baseline(train_oof, test_oof, train_ctx, test_ctx, df_train=None):
     lgb_model = LGBMClassifier(
         n_estimators=1500, learning_rate=0.01, max_depth=5,
         min_child_samples=50, reg_lambda=5.0,
-        random_state=RANDOM_STATE, verbose=-1
+        random_state=RANDOM_STATE, verbose=-1,
+        **GPU_PARAMS['lightgbm']
     )
     lgb_model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)])
     
@@ -640,7 +713,8 @@ def run_arch0_baseline(train_oof, test_oof, train_ctx, test_ctx, df_train=None):
     xgb_model = XGBClassifier(
         n_estimators=1500, learning_rate=0.01, max_depth=5,
         min_child_weight=50, reg_lambda=5.0,
-        random_state=RANDOM_STATE, verbosity=0, use_label_encoder=False
+        random_state=RANDOM_STATE, verbosity=0, use_label_encoder=False,
+        **GPU_PARAMS['xgboost']
     )
     xgb_model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
     
@@ -693,7 +767,8 @@ def run_arch1_moe(train_oof, test_oof, train_ctx, test_ctx):
     for i in range(5):
         model = CatBoostClassifier(
             iterations=500, learning_rate=0.05, depth=4,
-            verbose=0, random_seed=RANDOM_STATE
+            verbose=0, random_seed=RANDOM_STATE,
+            **GPU_PARAMS['catboost']
         )
         model.fit(ctx_train, (soft_weights[:, i] > 0.2).astype(int))
         weight_models.append(model)
@@ -724,7 +799,8 @@ def run_arch1_moe(train_oof, test_oof, train_ctx, test_ctx):
     
     model = CatBoostClassifier(
         iterations=1500, learning_rate=0.02, depth=6,
-        verbose=0, random_seed=RANDOM_STATE, early_stopping_rounds=150
+        verbose=0, random_seed=RANDOM_STATE, early_stopping_rounds=150,
+        **GPU_PARAMS['catboost']
     )
     model.fit(X_tr, y_tr, eval_set=(X_val, y_val))
     
@@ -776,7 +852,8 @@ def run_arch2_debate(train_oof, test_oof, train_ctx, test_ctx):
             
             model = CatBoostClassifier(
                 iterations=300, learning_rate=0.03, depth=4,
-                verbose=0, random_seed=RANDOM_STATE+round_num
+                verbose=0, random_seed=RANDOM_STATE+round_num,
+                **GPU_PARAMS['catboost']
             )
             model.fit(X_train_debate, y_train)
             revision_models[spec_name] = model
@@ -820,7 +897,8 @@ def run_arch2_debate(train_oof, test_oof, train_ctx, test_ctx):
     
     resolver = CatBoostClassifier(
         iterations=1000, learning_rate=0.02, depth=5,
-        verbose=0, random_seed=RANDOM_STATE, early_stopping_rounds=100
+        verbose=0, random_seed=RANDOM_STATE, early_stopping_rounds=100,
+        **GPU_PARAMS['catboost']
     )
     resolver.fit(X_tr, y_tr, eval_set=(X_val, y_val))
     
@@ -900,7 +978,8 @@ def run_arch3_gnn(train_oof, test_oof, train_ctx, test_ctx):
     
     model = CatBoostClassifier(
         iterations=1500, learning_rate=0.02, depth=6,
-        verbose=0, random_seed=RANDOM_STATE, early_stopping_rounds=150
+        verbose=0, random_seed=RANDOM_STATE, early_stopping_rounds=150,
+        **GPU_PARAMS['catboost']
     )
     model.fit(X_tr, y_tr, eval_set=(X_val, y_val))
     
@@ -940,7 +1019,8 @@ def run_arch4_transformer(train_oof, test_oof, train_ctx, test_ctx):
         is_good = (error < np.median(error)).astype(int)
         model = CatBoostClassifier(
             iterations=200, learning_rate=0.05, depth=3,
-            verbose=0, random_seed=RANDOM_STATE+i
+            verbose=0, random_seed=RANDOM_STATE+i,
+            **GPU_PARAMS['catboost']
         )
         model.fit(ctx_train, is_good)
         attention_models.append(model)
@@ -967,7 +1047,8 @@ def run_arch4_transformer(train_oof, test_oof, train_ctx, test_ctx):
     
     model = CatBoostClassifier(
         iterations=1000, learning_rate=0.02, depth=5,
-        verbose=0, random_seed=RANDOM_STATE, early_stopping_rounds=100
+        verbose=0, random_seed=RANDOM_STATE, early_stopping_rounds=100,
+        **GPU_PARAMS['catboost']
     )
     model.fit(X_tr, y_tr, eval_set=(X_val, y_val))
     
@@ -1042,7 +1123,8 @@ def run_arch5_clinical_reasoning(train_oof, test_oof, train_ctx, test_ctx):
     
     model = CatBoostClassifier(
         iterations=1000, learning_rate=0.02, depth=5,
-        verbose=0, random_seed=RANDOM_STATE, early_stopping_rounds=100
+        verbose=0, random_seed=RANDOM_STATE, early_stopping_rounds=100,
+        **GPU_PARAMS['catboost']
     )
     model.fit(X_tr, y_tr, eval_set=(X_val, y_val))
     
@@ -1123,7 +1205,8 @@ def run_arch6_temporal(train_oof, test_oof, train_ctx, test_ctx, df_train, df_te
     print("   Training trajectory specialist...")
     traj_model = CatBoostClassifier(
         iterations=500, learning_rate=0.03, depth=4,
-        verbose=0, random_seed=RANDOM_STATE
+        verbose=0, random_seed=RANDOM_STATE,
+        **GPU_PARAMS['catboost']
     )
     traj_model.fit(traj_train_scaled, y_train)
     
@@ -1141,7 +1224,8 @@ def run_arch6_temporal(train_oof, test_oof, train_ctx, test_ctx, df_train, df_te
     
     model = CatBoostClassifier(
         iterations=1500, learning_rate=0.02, depth=6,
-        verbose=0, random_seed=RANDOM_STATE, early_stopping_rounds=150
+        verbose=0, random_seed=RANDOM_STATE, early_stopping_rounds=150,
+        **GPU_PARAMS['catboost']
     )
     model.fit(X_tr, y_tr, eval_set=(X_val, y_val))
     
@@ -1157,7 +1241,7 @@ def run_arch6_temporal(train_oof, test_oof, train_ctx, test_ctx, df_train, df_te
 # =============================================================================
 # MAIN COMPARISON
 # =============================================================================
-def run_full_comparison(arch_nums: List[int], skip_specialist_training: bool = False, debug: bool = False):
+def run_full_comparison(arch_nums: List[int], skip_specialist_training: bool = False, debug: bool = False, half_data: bool = False):
     """Run specified architectures and compare results."""
     
     print("\n" + "=" * 70)
@@ -1168,10 +1252,13 @@ def run_full_comparison(arch_nums: List[int], skip_specialist_training: bool = F
     
     if debug:
         print("\n⚠️  DEBUG MODE ACTIVE: USING ONLY 2000 ROWS  ⚠️")
+    elif half_data:
+        print("\n⚠️  HALF-DATA MODE ACTIVE: USING 50% OF DATA FOR TESTING  ⚠️")
     
     # Load data
     print("\n📊 Loading data...")
     df = pd.read_csv(DATA_PATH)
+    original_len = len(df)
     print(f"   Total samples: {len(df):,}")
     
     # Create train/test split
@@ -1182,6 +1269,19 @@ def run_full_comparison(arch_nums: List[int], skip_specialist_training: bool = F
     if debug:
         df = df.head(2000)
         print(f"   DEBUG: Subsampled to {len(df)} rows")
+    elif half_data:
+        # Use half the data (stratified to maintain class balance)
+        if USE_TEMPORAL_SPLIT and 'dischtime' in df.columns:
+            # For temporal split, just take first half
+            df = df.iloc[:len(df)//2].reset_index(drop=True)
+        else:
+            # For stratified split, use stratified sampling
+            _, half_idx = train_test_split(
+                np.arange(len(df)), test_size=0.5, random_state=RANDOM_STATE,
+                stratify=df[TARGET]
+            )
+            df = df.iloc[half_idx].reset_index(drop=True)
+        print(f"   HALF-DATA: Subsampled to {len(df):,} rows ({len(df)/original_len*100:.1f}% of original)")
         
     if USE_TEMPORAL_SPLIT and 'dischtime' in df.columns:
         split_idx = int(len(df) * 0.8)
@@ -1204,8 +1304,14 @@ def run_full_comparison(arch_nums: List[int], skip_specialist_training: bool = F
         print("\n⏭️ Skipping specialist training, loading cached OOF predictions...")
         train_oof, test_oof, train_ctx, test_ctx = load_shared_data()
     else:
-        # Use fewer folds for debug to speed it up
-        n_folds = 2 if debug else DEFAULT_N_FOLDS
+        # Use fewer folds for debug/half-data to speed it up
+        if debug:
+            n_folds = 2
+        elif half_data:
+            n_folds = 2  # Use 2 folds for half-data mode
+        else:
+            n_folds = DEFAULT_N_FOLDS
+        print(f"   Using {n_folds}-fold CV")
         train_oof, test_oof = train_specialists_and_save_oof(
             df_train, df_test, n_folds=n_folds
         )
@@ -1372,7 +1478,11 @@ def main():
     )
     parser.add_argument(
         '--debug', action='store_true',
-        help='Run in debug mode (use 200 rows, 2 folds)'
+        help='Run in debug mode (use 2000 rows, 2 folds)'
+    )
+    parser.add_argument(
+        '--half-data', action='store_true',
+        help='Use half the data for testing (faster, good for validation)'
     )
     args = parser.parse_args()
     
@@ -1381,7 +1491,8 @@ def main():
     results = run_full_comparison(
         arch_nums=arch_nums,
         skip_specialist_training=args.skip_specialist_training,
-        debug=args.debug
+        debug=args.debug,
+        half_data=args.half_data
     )
     
     return results
