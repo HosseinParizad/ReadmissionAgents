@@ -115,9 +115,18 @@ class ClinicalBERTCache:
         # If cache is full, remove oldest entry (LRU eviction) - O(1) with deque
         if self.max_cache_size and len(self.cache) >= self.max_cache_size:
             if key not in self.cache:  # Only evict if adding new entry
-                oldest_key = self._access_order.popleft()  # O(1) instead of O(n)
-                self._access_set.discard(oldest_key)  # O(1)
-                del self.cache[oldest_key]
+                # Pop oldest keys until we find one that still exists in the cache
+                # (deque may contain duplicates for performance reasons).
+                while self._access_order:
+                    oldest_key = self._access_order.popleft()
+                    if oldest_key in self.cache:
+                        try:
+                            del self.cache[oldest_key]
+                        except KeyError:
+                            # If another thread/process removed it, continue
+                            continue
+                        self._access_set.discard(oldest_key)
+                        break
         
         self.cache[key] = embedding
         
