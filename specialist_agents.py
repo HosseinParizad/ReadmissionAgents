@@ -238,75 +238,75 @@ class LabSpecialist:
         - Lab trajectories (worsening/improving)
         - Critical value flags
         """
-        features = pd.DataFrame(index=X_labs.index)
-        
+        # Build feature columns in a dict first to avoid DataFrame fragmentation
+        feat: Dict[str, pd.Series] = {}
+
         # Core lab values
         lab_cols = [c for c in X_labs.columns if any(x in c.lower() for x in 
                     ['sodium', 'potassium', 'creatinine', 'bun', 'glucose', 
                      'hemoglobin', 'wbc', 'platelets', 'albumin', 'bilirubin',
                      'lactate', 'inr', 'troponin', 'bnp'])]
-        
         for col in lab_cols:
-            features[col] = X_labs[col].fillna(0)
-        
+            feat[col] = X_labs[col].fillna(0)
+
         # Organ dysfunction: Renal
         if 'creatinine_mean' in X_labs.columns:
-            features['renal_dysfunction'] = (X_labs['creatinine_mean'].fillna(1.0) > 1.5).astype(int)
-            features['severe_aki'] = (X_labs['creatinine_mean'].fillna(1.0) > 3.0).astype(int)
-        
+            feat['renal_dysfunction'] = (X_labs['creatinine_mean'].fillna(1.0) > 1.5).astype(int)
+            feat['severe_aki'] = (X_labs['creatinine_mean'].fillna(1.0) > 3.0).astype(int)
+
         if 'bun_mean' in X_labs.columns and 'creatinine_mean' in X_labs.columns:
             creat = X_labs['creatinine_mean'].fillna(1.0).replace(0, 1.0)
-            features['bun_creat_ratio'] = X_labs['bun_mean'].fillna(15) / creat
-            features['prerenal_pattern'] = (features['bun_creat_ratio'] > 20).astype(int)
-        
+            feat['bun_creat_ratio'] = X_labs['bun_mean'].fillna(15) / creat
+            feat['prerenal_pattern'] = (feat['bun_creat_ratio'] > 20).astype(int)
+
         # Organ dysfunction: Hepatic
         if 'bilirubin_mean' in X_labs.columns:
-            features['liver_dysfunction'] = (X_labs['bilirubin_mean'].fillna(1.0) > 2.0).astype(int)
-        
+            feat['liver_dysfunction'] = (X_labs['bilirubin_mean'].fillna(1.0) > 2.0).astype(int)
+
         if 'albumin_mean' in X_labs.columns:
-            features['hypoalbuminemia'] = (X_labs['albumin_mean'].fillna(4.0) < 3.0).astype(int)
-            features['severe_hypoalbuminemia'] = (X_labs['albumin_mean'].fillna(4.0) < 2.5).astype(int)
-        
+            feat['hypoalbuminemia'] = (X_labs['albumin_mean'].fillna(4.0) < 3.0).astype(int)
+            feat['severe_hypoalbuminemia'] = (X_labs['albumin_mean'].fillna(4.0) < 2.5).astype(int)
+
         # Organ dysfunction: Hematologic
         if 'hemoglobin_mean' in X_labs.columns:
-            features['anemia'] = (X_labs['hemoglobin_mean'].fillna(12) < 10).astype(int)
-            features['severe_anemia'] = (X_labs['hemoglobin_mean'].fillna(12) < 7).astype(int)
-        
+            feat['anemia'] = (X_labs['hemoglobin_mean'].fillna(12) < 10).astype(int)
+            feat['severe_anemia'] = (X_labs['hemoglobin_mean'].fillna(12) < 7).astype(int)
+
         if 'platelets_mean' in X_labs.columns:
-            features['thrombocytopenia'] = (X_labs['platelets_mean'].fillna(200) < 100).astype(int)
-        
+            feat['thrombocytopenia'] = (X_labs['platelets_mean'].fillna(200) < 100).astype(int)
+
         if 'wbc_mean' in X_labs.columns:
-            features['leukocytosis'] = (X_labs['wbc_mean'].fillna(8) > 12).astype(int)
-            features['leukopenia'] = (X_labs['wbc_mean'].fillna(8) < 4).astype(int)
-        
+            feat['leukocytosis'] = (X_labs['wbc_mean'].fillna(8) > 12).astype(int)
+            feat['leukopenia'] = (X_labs['wbc_mean'].fillna(8) < 4).astype(int)
+
         # Metabolic derangements
         if 'sodium_mean' in X_labs.columns:
-            features['hyponatremia'] = (X_labs['sodium_mean'].fillna(140) < 130).astype(int)
-            features['hypernatremia'] = (X_labs['sodium_mean'].fillna(140) > 150).astype(int)
-        
+            feat['hyponatremia'] = (X_labs['sodium_mean'].fillna(140) < 130).astype(int)
+            feat['hypernatremia'] = (X_labs['sodium_mean'].fillna(140) > 150).astype(int)
+
         if 'potassium_mean' in X_labs.columns:
-            features['hypokalemia'] = (X_labs['potassium_mean'].fillna(4.0) < 3.0).astype(int)
-            features['hyperkalemia'] = (X_labs['potassium_mean'].fillna(4.0) > 5.5).astype(int)
-        
+            feat['hypokalemia'] = (X_labs['potassium_mean'].fillna(4.0) < 3.0).astype(int)
+            feat['hyperkalemia'] = (X_labs['potassium_mean'].fillna(4.0) > 5.5).astype(int)
+
         if 'glucose_mean' in X_labs.columns:
-            features['hyperglycemia'] = (X_labs['glucose_mean'].fillna(100) > 200).astype(int)
-            features['hypoglycemia'] = (X_labs['glucose_mean'].fillna(100) < 70).astype(int)
-        
+            feat['hyperglycemia'] = (X_labs['glucose_mean'].fillna(100) > 200).astype(int)
+            feat['hypoglycemia'] = (X_labs['glucose_mean'].fillna(100) < 70).astype(int)
+
         # Critical markers
         if 'lactate_mean' in X_labs.columns:
-            features['elevated_lactate'] = (X_labs['lactate_mean'].fillna(1.0) > 2.0).astype(int)
-            features['severe_lactate'] = (X_labs['lactate_mean'].fillna(1.0) > 4.0).astype(int)
-        
+            feat['elevated_lactate'] = (X_labs['lactate_mean'].fillna(1.0) > 2.0).astype(int)
+            feat['severe_lactate'] = (X_labs['lactate_mean'].fillna(1.0) > 4.0).astype(int)
+
         if 'troponin_mean' in X_labs.columns:
-            features['elevated_troponin'] = (X_labs['troponin_mean'].fillna(0) > 0.04).astype(int)
-        
+            feat['elevated_troponin'] = (X_labs['troponin_mean'].fillna(0) > 0.04).astype(int)
+
         if 'bnp_mean' in X_labs.columns:
-            features['elevated_bnp'] = (X_labs['bnp_mean'].fillna(100) > 400).astype(int)
-        
+            feat['elevated_bnp'] = (X_labs['bnp_mean'].fillna(100) > 400).astype(int)
+
         # Coagulopathy
         if 'inr_mean' in X_labs.columns:
-            features['coagulopathy'] = (X_labs['inr_mean'].fillna(1.0) > 1.5).astype(int)
-        
+            feat['coagulopathy'] = (X_labs['inr_mean'].fillna(1.0) > 1.5).astype(int)
+
         # Lab trajectory features (first vs last)
         trajectory_labs = ['creatinine', 'hemoglobin', 'wbc', 'platelets', 'sodium', 'potassium']
         for lab in trajectory_labs:
@@ -315,26 +315,34 @@ class LabSpecialist:
             if first_col in X_labs.columns and last_col in X_labs.columns:
                 first_val = X_labs[first_col].fillna(0)
                 last_val = X_labs[last_col].fillna(0)
-                features[f'{lab}_delta'] = last_val - first_val
-                features[f'{lab}_improving'] = (features[f'{lab}_delta'] < 0).astype(int) if lab in ['creatinine', 'wbc'] else (features[f'{lab}_delta'] > 0).astype(int)
-        
+                feat[f'{lab}_delta'] = last_val - first_val
+                if lab in ['creatinine', 'wbc']:
+                    feat[f'{lab}_improving'] = (feat[f'{lab}_delta'] < 0).astype(int)
+                else:
+                    feat[f'{lab}_improving'] = (feat[f'{lab}_delta'] > 0).astype(int)
+
         # Aggregate dysfunction score
-        dysfunction_cols = [c for c in features.columns if 'dysfunction' in c or 'severe' in c]
+        dysfunction_cols = [k for k in feat.keys() if 'dysfunction' in k or 'severe' in k]
         if dysfunction_cols:
-            features['total_organ_dysfunction'] = features[dysfunction_cols].sum(axis=1)
-        
+            # elementwise sum of Series
+            feat['total_organ_dysfunction'] = sum([feat[c] for c in dysfunction_cols])
+
         # Lab instability (high variance)
         std_cols = [c for c in X_labs.columns if '_std' in c]
         if std_cols:
-            features['lab_instability'] = X_labs[std_cols].fillna(0).mean(axis=1)
-        
+            feat['lab_instability'] = X_labs[std_cols].fillna(0).mean(axis=1)
+
         # Context features that help interpretation
         if 'had_icu_stay' in X_context.columns:
-            features['icu_with_lab_issues'] = (
+            # Ensure total_organ_dysfunction exists in feat (if not, treat as zeros)
+            tod = feat.get('total_organ_dysfunction', pd.Series(0, index=X_labs.index))
+            feat['icu_with_lab_issues'] = (
                 (X_context['had_icu_stay'] == 1) & 
-                (features.get('total_organ_dysfunction', pd.Series(0, index=features.index)) > 0)
+                (tod > 0)
             ).astype(int)
-        
+
+        # Create DataFrame once from the dict to avoid fragmentation
+        features = pd.DataFrame(feat, index=X_labs.index)
         return features
     
     def learn(self, X_labs: pd.DataFrame, X_context: pd.DataFrame, y: np.ndarray) -> None:
