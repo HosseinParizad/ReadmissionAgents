@@ -93,7 +93,7 @@ print("=" * 70)
 
 # Check CatBoost
 try:
-    from catboost import CatBoostClassifier
+    from catboost import CatBoostClassifier, CatBoostRegressor
     print("   ✅ CatBoost loaded successfully")
 except ImportError as e:
     raise ImportError(f"❌ REQUIRED: CatBoost not installed!\n   Install with: pip install catboost\n   Error: {e}")
@@ -281,6 +281,95 @@ class SpecialistCalibrator:
         if name in self.calibrators:
             return self.calibrators[name].transform(predictions)
         return predictions
+
+
+# =============================================================================
+# CONTEXT-CONDITIONAL CALIBRATOR (LIGHTWEIGHT, ARCHITECTURE-PRESERVING)
+# =============================================================================
+class ContextConditionalCalibrator:
+    """Fits per-subgroup isotonic calibrators using a small set of context features.
+
+    Goal: fix systematic miscalibration that varies by patient context (e.g., ICU vs non-ICU)
+    without changing the core architecture.
+    """
+
+    def __init__(self, min_group_size: int = 500):
+        self.min_group_size = min_group_size
+        self.global_calibrators = {}
+        self.group_calibrators = {}  # (name, key) -> calibrator
+        self.group_cols = None
+
+    @staticmethod
+    def _pick_group_cols(ctx_df: pd.DataFrame) -> List[str]:
+        """Pick a small, robust set of grouping columns if present."""
+        candidates = [
+            'had_icu_stay', 'icu', 'is_icu',
+            'is_emergency', 'emergency',
+            'discharge_to_snf', 'discharge_to_rehab',
+            'age', 'age_years',
+            'length_of_stay', 'los',
+            'num_comorbidities', 'comorbidity_count'
+        ]
+        cols = [c for c in candidates if c in ctx_df.columns]
+        # Keep at most 3 cols to control group explosion
+        return cols[:3]
+
+    @staticmethod
+    def _binarize_series(s: pd.Series) -> pd.Series:
+        # Treat booleans/0-1 as-is; otherwise threshold at median
+        s2 = s.fillna(0)
+        uniq = s2.dropna().unique()
+        if len(uniq) <= 2:
+            return (s2 > 0).astype(int)
+        return (s2 > s2.median()).astype(int)
+
+    def _make_group_keys(self, ctx_df: pd.DataFrame) -> np.ndarray:
+        if self.group_cols is None:
+            self.group_cols = self._pick_group_cols(ctx_df)
+        if not self.group_cols:
+            return np.array(['__all__'] * len(ctx_df))
+
+        parts = []
+        for c in self.group_cols:
+            parts.append(self._binarize_series(ctx_df[c]).astype(str).values)
+        keys = ['|'.join(items) for items in zip(*parts)]
+        return np.array(keys, dtype=object)
+
+    def fit(self, name: str, predictions: np.ndarray, labels: np.ndarray, ctx_df: pd.DataFrame):
+        # Global calibrator
+        gcal = IsotonicRegression(out_of_bounds='clip')
+        gcal.fit(predictions, labels)
+        self.global_calibrators[name] = gcal
+
+        keys = self._make_group_keys(ctx_df)
+        self.group_calibrators[name] = {}
+
+        # Per-group calibrators
+        for key in np.unique(keys):
+            idx = np.where(keys == key)[0]
+            if len(idx) < self.min_group_size:
+                continue
+            cal = IsotonicRegression(out_of_bounds='clip')
+            cal.fit(predictions[idx], labels[idx])
+            self.group_calibrators[name][key] = cal
+
+    def transform(self, name: str, predictions: np.ndarray, ctx_df: pd.DataFrame) -> np.ndarray:
+        if name not in self.global_calibrators:
+            return predictions
+
+        keys = self._make_group_keys(ctx_df)
+        out = np.array(predictions, copy=True)
+        gcal = self.global_calibrators[name]
+        out = gcal.transform(out)
+
+        # Apply per-group overrides where available
+        gmap = self.group_calibrators.get(name, {})
+        if gmap:
+            for key, cal in gmap.items():
+                idx = np.where(keys == key)[0]
+                if len(idx):
+                    out[idx] = cal.transform(predictions[idx])
+        return out
 
 
 # =============================================================================
@@ -562,20 +651,23 @@ def get_context_features(ctx_df: pd.DataFrame) -> np.ndarray:
     return ctx_df[cols].fillna(0).values
 
 
-def evaluate_predictions(y_true: np.ndarray, y_prob: np.ndarray) -> Dict:
-    """Compute comprehensive evaluation metrics."""
-    # Find optimal threshold
-    best_f1, best_thresh = 0, 0.5
-    for thresh in np.arange(0.05, 0.5, 0.01):
+def find_best_threshold_f1(y_true: np.ndarray, y_prob: np.ndarray, thresh_min: float = 0.01,
+                           thresh_max: float = 0.5, step: float = 0.01) -> float:
+    """Select threshold on a *validation* set to maximize F1 (prevents test leakage)."""
+    best_f1, best_thresh = 0.0, 0.5
+    for thresh in np.arange(thresh_min, thresh_max + 1e-9, step):
         f1 = f1_score(y_true, (y_prob >= thresh).astype(int))
         if f1 > best_f1:
-            best_f1, best_thresh = f1, thresh
-    
-    y_pred = (y_prob >= best_thresh).astype(int)
+            best_f1, best_thresh = f1, float(thresh)
+    return best_thresh
+
+
+def evaluate_predictions(y_true: np.ndarray, y_prob: np.ndarray, threshold: float = 0.5) -> Dict:
+    """Compute evaluation metrics at a provided threshold (no threshold tuning on test)."""
+    y_pred = (y_prob >= threshold).astype(int)
     cm = confusion_matrix(y_true, y_pred)
-    
-    # Compute all metrics
-    results = {
+
+    return {
         'auc': roc_auc_score(y_true, y_prob),
         'auprc': average_precision_score(y_true, y_prob),
         'f1': f1_score(y_true, y_pred),
@@ -583,14 +675,12 @@ def evaluate_predictions(y_true: np.ndarray, y_prob: np.ndarray) -> Dict:
         'recall': recall_score(y_true, y_pred),
         'specificity': cm[0, 0] / (cm[0, 0] + cm[0, 1]) if (cm[0, 0] + cm[0, 1]) > 0 else 0,
         'brier': brier_score_loss(y_true, y_prob),
-        'threshold': best_thresh,
-        'tn': cm[0, 0],
-        'fp': cm[0, 1],
-        'fn': cm[1, 0],
-        'tp': cm[1, 1],
+        'threshold': float(threshold),
+        'tn': int(cm[0, 0]),
+        'fp': int(cm[0, 1]),
+        'fn': int(cm[1, 0]),
+        'tp': int(cm[1, 1]),
     }
-    
-    return results
 
 
 # =============================================================================
@@ -611,16 +701,67 @@ def run_arch0_baseline(train_oof, test_oof, train_ctx, test_ctx, df_train=None):
     spec_test = get_specialist_preds(test_oof)
     ctx_train = get_context_features(train_ctx)
     ctx_test = get_context_features(test_ctx)
+
+    # -------------------------------------------------------------------------
+    # Learn lightweight specialist error predictors (reliability models)
+    # Trains on OOF predictions to predict absolute error from context + opinions.
+    # This preserves the overall architecture while improving robustness.
+    # -------------------------------------------------------------------------
+    print("   Training specialist reliability models...")
+
+    # Build error-model feature matrix
+    base_stats_train = np.column_stack([
+        np.mean(spec_train, axis=1),
+        np.std(spec_train, axis=1),
+        np.max(spec_train, axis=1),
+        np.min(spec_train, axis=1),
+    ])
+    base_stats_test = np.column_stack([
+        np.mean(spec_test, axis=1),
+        np.std(spec_test, axis=1),
+        np.max(spec_test, axis=1),
+        np.min(spec_test, axis=1),
+    ])
+
+    X_err_train = np.column_stack([ctx_train, spec_train, base_stats_train])
+    X_err_test = np.column_stack([ctx_test, spec_test, base_stats_test])
+
+    errhat_train = {}
+    errhat_test = {}
+
+    for i, name in enumerate(['lab','note','pharm','hist','psych']):
+        y_err = np.abs(spec_train[:, i] - y_train)
+        # CatBoostRegressor is robust, fast, and handles non-linearities.
+        reg = CatBoostRegressor(
+            iterations=600,
+            learning_rate=0.05,
+            depth=4,
+            loss_function='MAE',
+            verbose=0,
+            random_seed=RANDOM_STATE,
+            **GPU_PARAMS['catboost']
+        )
+        reg.fit(X_err_train, y_err)
+        errhat_train[name] = np.clip(reg.predict(X_err_train), 0.0, 1.0)
+        errhat_test[name] = np.clip(reg.predict(X_err_test), 0.0, 1.0)
+
+    # Attach to OOF frames so build_doctor_features can consume them
+    for name in ['lab','note','pharm','hist','psych']:
+        train_oof[f'errhat_{name}'] = errhat_train[name]
+        test_oof[f'errhat_{name}'] = errhat_test[name]
     
-    # Calibrate specialists
-    print("   Calibrating specialists...")
-    calibrator = SpecialistCalibrator()
+    # Calibrate specialists (context-conditional to reduce subgroup miscalibration)
+    print("   Calibrating specialists (context-conditional)...")
+    ctx_train_df = train_ctx.drop(columns=['split'], errors='ignore').reset_index(drop=True)
+    ctx_test_df = test_ctx.drop(columns=['split'], errors='ignore').reset_index(drop=True)
+
+    calibrator = ContextConditionalCalibrator(min_group_size=500)
     spec_names = ['lab', 'note', 'pharm', 'hist', 'psych']
-    
+
     for i, name in enumerate(spec_names):
-        calibrator.fit(name, spec_train[:, i], y_train)
-        spec_train[:, i] = calibrator.transform(name, spec_train[:, i])
-        spec_test[:, i] = calibrator.transform(name, spec_test[:, i])
+        calibrator.fit(name, spec_train[:, i], y_train, ctx_train_df)
+        spec_train[:, i] = calibrator.transform(name, spec_train[:, i], ctx_train_df)
+        spec_test[:, i] = calibrator.transform(name, spec_test[:, i], ctx_test_df)
     
     # Build Doctor features (matching your train_model.py)
     print("   Building Doctor Agent features...")
@@ -662,6 +803,25 @@ def run_arch0_baseline(train_oof, test_oof, train_ctx, test_ctx, df_train=None):
             features['op_psych_mental'] = oof_df['op_psych_mental'].values
             features['op_psych_care'] = oof_df['op_psych_care'].values
             features['op_psych_social'] = oof_df['op_psych_social'].values
+
+        # 6b. Specialist reliability / confidence (predicted absolute error)
+        # These are computed outside and passed in via oof_df columns when available.
+        for name in ['lab','note','pharm','hist','psych']:
+            col_err = f'errhat_{name}'
+            if col_err in oof_df.columns:
+                err = oof_df[col_err].values
+                features[f'conf_{name}'] = 1.0 - np.clip(err, 0.0, 1.0)
+
+        # Confidence-weighted aggregation (more robust than mean when specialists are unreliable)
+        conf_cols = [c for c in features.keys() if c.startswith('conf_')]
+        if conf_cols:
+            conf_mat = np.column_stack([features[c] for c in conf_cols])
+            conf_sum = np.maximum(1e-6, conf_mat.sum(axis=1))
+            features['conf_mean'] = conf_sum / conf_mat.shape[1]
+            # Align specialist order to conf columns order
+            spec_mat = spec_preds[:, :len(conf_cols)]
+            features['op_conf_weighted'] = (spec_mat * conf_mat).sum(axis=1) / conf_sum
+            features['conf_low_flag'] = (features['conf_mean'] < 0.6).astype(int)
         
         # 7. Context features
         ctx_df = pd.DataFrame(ctx_features)
@@ -690,12 +850,18 @@ def run_arch0_baseline(train_oof, test_oof, train_ctx, test_ctx, df_train=None):
     X_tr, X_val, y_tr, y_val = train_test_split(
         X_train, y_train, test_size=0.15, stratify=y_train, random_state=RANDOM_STATE
     )
+
+    # Class imbalance handling (improves AUPRC in practice)
+    n_pos = max(1, int(y_tr.sum()))
+    n_neg = max(1, int((1 - y_tr).sum()))
+    pos_weight = n_neg / n_pos
     
     # CatBoost
     cat_model = CatBoostClassifier(
         iterations=2000, learning_rate=0.01, depth=6,
         l2_leaf_reg=8, min_data_in_leaf=30,
         early_stopping_rounds=200, verbose=0, random_seed=RANDOM_STATE,
+        scale_pos_weight=pos_weight,
         **GPU_PARAMS['catboost']
     )
     cat_model.fit(X_tr, y_tr, eval_set=(X_val, y_val))
@@ -705,6 +871,7 @@ def run_arch0_baseline(train_oof, test_oof, train_ctx, test_ctx, df_train=None):
         n_estimators=1500, learning_rate=0.01, max_depth=5,
         min_child_samples=50, reg_lambda=5.0,
         random_state=RANDOM_STATE, verbose=-1,
+        scale_pos_weight=pos_weight,
         **GPU_PARAMS['lightgbm']
     )
     lgb_model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)])
@@ -714,6 +881,7 @@ def run_arch0_baseline(train_oof, test_oof, train_ctx, test_ctx, df_train=None):
         n_estimators=1500, learning_rate=0.01, max_depth=5,
         min_child_weight=50, reg_lambda=5.0,
         random_state=RANDOM_STATE, verbosity=0, use_label_encoder=False,
+        scale_pos_weight=pos_weight,
         **GPU_PARAMS['xgboost']
     )
     xgb_model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
@@ -734,7 +902,10 @@ def run_arch0_baseline(train_oof, test_oof, train_ctx, test_ctx, df_train=None):
     final_calibrator.fit(y_prob_val, y_val)
     y_prob = final_calibrator.transform(y_prob)
     
-    return evaluate_predictions(y_test, y_prob)
+    # Select threshold on validation set (prevents test leakage)
+    best_thresh = find_best_threshold_f1(y_val, y_prob_val)
+
+    return evaluate_predictions(y_test, y_prob, threshold=best_thresh)
 
 
 # =============================================================================
@@ -796,6 +967,11 @@ def run_arch1_moe(train_oof, test_oof, train_ctx, test_ctx):
     X_tr, X_val, y_tr, y_val = train_test_split(
         X_train, y_train, test_size=0.15, stratify=y_train, random_state=RANDOM_STATE
     )
+
+    # Class imbalance handling (improves AUPRC in practice)
+    n_pos = max(1, int(y_tr.sum()))
+    n_neg = max(1, int((1 - y_tr).sum()))
+    pos_weight = n_neg / n_pos
     
     model = CatBoostClassifier(
         iterations=1500, learning_rate=0.02, depth=6,
@@ -810,7 +986,10 @@ def run_arch1_moe(train_oof, test_oof, train_ctx, test_ctx):
     calibrator.fit(model.predict_proba(X_val)[:, 1], y_val)
     y_prob = calibrator.transform(y_prob)
     
-    return evaluate_predictions(y_test, y_prob)
+    # Select threshold on validation set (prevents test leakage)
+    best_thresh = find_best_threshold_f1(y_val, y_prob_val)
+
+    return evaluate_predictions(y_test, y_prob, threshold=best_thresh)
 
 
 # =============================================================================
@@ -894,6 +1073,11 @@ def run_arch2_debate(train_oof, test_oof, train_ctx, test_ctx):
     X_tr, X_val, y_tr, y_val = train_test_split(
         X_train, y_train, test_size=0.15, stratify=y_train, random_state=RANDOM_STATE
     )
+
+    # Class imbalance handling (improves AUPRC in practice)
+    n_pos = max(1, int(y_tr.sum()))
+    n_neg = max(1, int((1 - y_tr).sum()))
+    pos_weight = n_neg / n_pos
     
     resolver = CatBoostClassifier(
         iterations=1000, learning_rate=0.02, depth=5,
@@ -908,7 +1092,10 @@ def run_arch2_debate(train_oof, test_oof, train_ctx, test_ctx):
     calibrator.fit(resolver.predict_proba(X_val)[:, 1], y_val)
     y_prob = calibrator.transform(y_prob)
     
-    return evaluate_predictions(y_test, y_prob)
+    # Select threshold on validation set (prevents test leakage)
+    best_thresh = find_best_threshold_f1(y_val, y_prob_val)
+
+    return evaluate_predictions(y_test, y_prob, threshold=best_thresh)
 
 
 # =============================================================================
@@ -975,6 +1162,11 @@ def run_arch3_gnn(train_oof, test_oof, train_ctx, test_ctx):
     X_tr, X_val, y_tr, y_val = train_test_split(
         X_train, y_train, test_size=0.15, stratify=y_train, random_state=RANDOM_STATE
     )
+
+    # Class imbalance handling (improves AUPRC in practice)
+    n_pos = max(1, int(y_tr.sum()))
+    n_neg = max(1, int((1 - y_tr).sum()))
+    pos_weight = n_neg / n_pos
     
     model = CatBoostClassifier(
         iterations=1500, learning_rate=0.02, depth=6,
@@ -989,7 +1181,10 @@ def run_arch3_gnn(train_oof, test_oof, train_ctx, test_ctx):
     calibrator.fit(model.predict_proba(X_val)[:, 1], y_val)
     y_prob = calibrator.transform(y_prob)
     
-    return evaluate_predictions(y_test, y_prob)
+    # Select threshold on validation set (prevents test leakage)
+    best_thresh = find_best_threshold_f1(y_val, y_prob_val)
+
+    return evaluate_predictions(y_test, y_prob, threshold=best_thresh)
 
 
 # =============================================================================
@@ -1044,6 +1239,11 @@ def run_arch4_transformer(train_oof, test_oof, train_ctx, test_ctx):
     X_tr, X_val, y_tr, y_val = train_test_split(
         X_train, y_train, test_size=0.15, stratify=y_train, random_state=RANDOM_STATE
     )
+
+    # Class imbalance handling (improves AUPRC in practice)
+    n_pos = max(1, int(y_tr.sum()))
+    n_neg = max(1, int((1 - y_tr).sum()))
+    pos_weight = n_neg / n_pos
     
     model = CatBoostClassifier(
         iterations=1000, learning_rate=0.02, depth=5,
@@ -1058,7 +1258,10 @@ def run_arch4_transformer(train_oof, test_oof, train_ctx, test_ctx):
     calibrator.fit(model.predict_proba(X_val)[:, 1], y_val)
     y_prob = calibrator.transform(y_prob)
     
-    return evaluate_predictions(y_test, y_prob)
+    # Select threshold on validation set (prevents test leakage)
+    best_thresh = find_best_threshold_f1(y_val, y_prob_val)
+
+    return evaluate_predictions(y_test, y_prob, threshold=best_thresh)
 
 
 # =============================================================================
@@ -1120,6 +1323,11 @@ def run_arch5_clinical_reasoning(train_oof, test_oof, train_ctx, test_ctx):
     X_tr, X_val, y_tr, y_val = train_test_split(
         X_train, y_train, test_size=0.15, stratify=y_train, random_state=RANDOM_STATE
     )
+
+    # Class imbalance handling (improves AUPRC in practice)
+    n_pos = max(1, int(y_tr.sum()))
+    n_neg = max(1, int((1 - y_tr).sum()))
+    pos_weight = n_neg / n_pos
     
     model = CatBoostClassifier(
         iterations=1000, learning_rate=0.02, depth=5,
@@ -1134,7 +1342,10 @@ def run_arch5_clinical_reasoning(train_oof, test_oof, train_ctx, test_ctx):
     calibrator.fit(model.predict_proba(X_val)[:, 1], y_val)
     y_prob = calibrator.transform(y_prob)
     
-    return evaluate_predictions(y_test, y_prob)
+    # Select threshold on validation set (prevents test leakage)
+    best_thresh = find_best_threshold_f1(y_val, y_prob_val)
+
+    return evaluate_predictions(y_test, y_prob, threshold=best_thresh)
 
 
 # =============================================================================
@@ -1206,6 +1417,7 @@ def run_arch6_temporal(train_oof, test_oof, train_ctx, test_ctx, df_train, df_te
     traj_model = CatBoostClassifier(
         iterations=500, learning_rate=0.03, depth=4,
         verbose=0, random_seed=RANDOM_STATE,
+        scale_pos_weight=pos_weight,
         **GPU_PARAMS['catboost']
     )
     traj_model.fit(traj_train_scaled, y_train)
@@ -1221,6 +1433,11 @@ def run_arch6_temporal(train_oof, test_oof, train_ctx, test_ctx, df_train, df_te
     X_tr, X_val, y_tr, y_val = train_test_split(
         X_train, y_train, test_size=0.15, stratify=y_train, random_state=RANDOM_STATE
     )
+
+    # Class imbalance handling (improves AUPRC in practice)
+    n_pos = max(1, int(y_tr.sum()))
+    n_neg = max(1, int((1 - y_tr).sum()))
+    pos_weight = n_neg / n_pos
     
     model = CatBoostClassifier(
         iterations=1500, learning_rate=0.02, depth=6,
@@ -1235,7 +1452,10 @@ def run_arch6_temporal(train_oof, test_oof, train_ctx, test_ctx, df_train, df_te
     calibrator.fit(model.predict_proba(X_val)[:, 1], y_val)
     y_prob = calibrator.transform(y_prob)
     
-    return evaluate_predictions(y_test, y_prob)
+    # Select threshold on validation set (prevents test leakage)
+    best_thresh = find_best_threshold_f1(y_val, y_prob_val)
+
+    return evaluate_predictions(y_test, y_prob, threshold=best_thresh)
 
 
 # =============================================================================
