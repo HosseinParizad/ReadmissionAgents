@@ -689,12 +689,18 @@ def evaluate_predictions(y_true: np.ndarray, y_prob: np.ndarray, threshold: floa
 def run_arch0_baseline(train_oof, test_oof, train_ctx, test_ctx, df_train=None):
     """
     Architecture 0: Interpretable Multi-Specialist Ensemble (IMSE)
-    This is your current train_model.py architecture.
+
+    Minimal-change improvements (no architectural change):
+      1) Context-conditional specialist calibration
+      2) Reliability / confidence features for Doctor Agent
+      3) Meta-learner trained with StratifiedKFold OOF (reduces split variance)
+      4) Final isotonic calibration fitted on OOF predictions (no leakage)
+      5) Threshold selected on OOF (no leakage)
     """
     print("\n" + "-" * 60)
     print("ARCH 0: INTERPRETABLE MULTI-SPECIALIST ENSEMBLE (IMSE)")
     print("-" * 60)
-    
+
     y_train = train_oof['y_true'].values
     y_test = test_oof['y_true'].values
     spec_train = get_specialist_preds(train_oof)
@@ -702,55 +708,9 @@ def run_arch0_baseline(train_oof, test_oof, train_ctx, test_ctx, df_train=None):
     ctx_train = get_context_features(train_ctx)
     ctx_test = get_context_features(test_ctx)
 
-    # -------------------------------------------------------------------------
-    # Learn lightweight specialist error predictors (reliability models)
-    # Trains on OOF predictions to predict absolute error from context + opinions.
-    # This preserves the overall architecture while improving robustness.
-    # -------------------------------------------------------------------------
-    print("   Training specialist reliability models...")
-
-    # Build error-model feature matrix
-    base_stats_train = np.column_stack([
-        np.mean(spec_train, axis=1),
-        np.std(spec_train, axis=1),
-        np.max(spec_train, axis=1),
-        np.min(spec_train, axis=1),
-    ])
-    base_stats_test = np.column_stack([
-        np.mean(spec_test, axis=1),
-        np.std(spec_test, axis=1),
-        np.max(spec_test, axis=1),
-        np.min(spec_test, axis=1),
-    ])
-
-    X_err_train = np.column_stack([ctx_train, spec_train, base_stats_train])
-    X_err_test = np.column_stack([ctx_test, spec_test, base_stats_test])
-
-    errhat_train = {}
-    errhat_test = {}
-
-    for i, name in enumerate(['lab','note','pharm','hist','psych']):
-        y_err = np.abs(spec_train[:, i] - y_train)
-        # CatBoostRegressor is robust, fast, and handles non-linearities.
-        reg = CatBoostRegressor(
-            iterations=600,
-            learning_rate=0.05,
-            depth=4,
-            loss_function='MAE',
-            verbose=0,
-            random_seed=RANDOM_STATE,
-            **GPU_PARAMS['catboost']
-        )
-        reg.fit(X_err_train, y_err)
-        errhat_train[name] = np.clip(reg.predict(X_err_train), 0.0, 1.0)
-        errhat_test[name] = np.clip(reg.predict(X_err_test), 0.0, 1.0)
-
-    # Attach to OOF frames so build_doctor_features can consume them
-    for name in ['lab','note','pharm','hist','psych']:
-        train_oof[f'errhat_{name}'] = errhat_train[name]
-        test_oof[f'errhat_{name}'] = errhat_test[name]
-    
-    # Calibrate specialists (context-conditional to reduce subgroup miscalibration)
+    # ----------------------------
+    # 1) Context-conditional calibration of specialists
+    # ----------------------------
     print("   Calibrating specialists (context-conditional)...")
     ctx_train_df = train_ctx.drop(columns=['split'], errors='ignore').reset_index(drop=True)
     ctx_test_df = test_ctx.drop(columns=['split'], errors='ignore').reset_index(drop=True)
@@ -762,101 +722,151 @@ def run_arch0_baseline(train_oof, test_oof, train_ctx, test_ctx, df_train=None):
         calibrator.fit(name, spec_train[:, i], y_train, ctx_train_df)
         spec_train[:, i] = calibrator.transform(name, spec_train[:, i], ctx_train_df)
         spec_test[:, i] = calibrator.transform(name, spec_test[:, i], ctx_test_df)
-    
-    # Build Doctor features (matching your train_model.py)
-    print("   Building Doctor Agent features...")
-    
-    def build_doctor_features(spec_preds, ctx_features, oof_df):
-        """Build interpretable features for Doctor Agent."""
+
+    # ----------------------------
+    # 2) Build Doctor features (interpretable + confidence)
+    # ----------------------------
+    print("   Building Doctor Agent features (with confidence)...")
+
+    def build_doctor_features(spec_preds, ctx_features, oof_df, conf_features=None):
         n = len(spec_preds)
-        features = {}
-        
-        # 1. Specialist opinions
+        feats = {}
+
+        # Specialist opinions
         for i, name in enumerate(spec_names):
-            features[f'op_{name}'] = spec_preds[:, i]
-        
-        # 2. Ensemble statistics
-        features['op_mean'] = np.mean(spec_preds, axis=1)
-        features['op_std'] = np.std(spec_preds, axis=1)
-        features['op_max'] = np.max(spec_preds, axis=1)
-        features['op_min'] = np.min(spec_preds, axis=1)
-        features['op_range'] = features['op_max'] - features['op_min']
-        
-        # 3. Consensus features
+            feats[f'op_{name}'] = spec_preds[:, i]
+
+        # Ensemble stats
+        feats['op_mean'] = np.mean(spec_preds, axis=1)
+        feats['op_std'] = np.std(spec_preds, axis=1)
+        feats['op_max'] = np.max(spec_preds, axis=1)
+        feats['op_min'] = np.min(spec_preds, axis=1)
+        feats['op_range'] = feats['op_max'] - feats['op_min']
+
+        # Consensus / disagreement
         high_risk = spec_preds > 0.6
-        features['n_high_risk'] = np.sum(high_risk, axis=1)
-        features['consensus_high'] = (features['n_high_risk'] >= 3).astype(int)
-        features['consensus_low'] = (features['n_high_risk'] == 0).astype(int)
-        features['any_very_high'] = (np.max(spec_preds, axis=1) > 0.75).astype(int)
-        
-        # 4. Disagreement features
-        features['max_disagreement'] = np.max(np.abs(
+        feats['n_high_risk'] = np.sum(high_risk, axis=1)
+        feats['consensus_high'] = (feats['n_high_risk'] >= 3).astype(int)
+        feats['consensus_low'] = (feats['n_high_risk'] == 0).astype(int)
+        feats['any_very_high'] = (np.max(spec_preds, axis=1) > 0.75).astype(int)
+
+        feats['max_disagreement'] = np.max(np.abs(
             spec_preds[:, :, np.newaxis] - spec_preds[:, np.newaxis, :]
         ).reshape(n, -1), axis=1)
-        
-        # 5. Weighted combinations
+
+        # Simple clinically-motivated weighted combination
         weights_clinical = np.array([0.15, 0.35, 0.15, 0.20, 0.15])
-        features['weighted_clinical'] = np.sum(spec_preds * weights_clinical, axis=1)
-        
-        # 6. Psychosocial sub-specialists
+        feats['weighted_clinical'] = np.sum(spec_preds * weights_clinical, axis=1)
+
+        # Psychosocial sub-specialists (if available)
         if 'op_psych_mental' in oof_df.columns:
-            features['op_psych_mental'] = oof_df['op_psych_mental'].values
-            features['op_psych_care'] = oof_df['op_psych_care'].values
-            features['op_psych_social'] = oof_df['op_psych_social'].values
+            feats['op_psych_mental'] = oof_df['op_psych_mental'].values
+            feats['op_psych_care'] = oof_df['op_psych_care'].values
+            feats['op_psych_social'] = oof_df['op_psych_social'].values
 
-        # 6b. Specialist reliability / confidence (predicted absolute error)
-        # These are computed outside and passed in via oof_df columns when available.
-        for name in ['lab','note','pharm','hist','psych']:
-            col_err = f'errhat_{name}'
-            if col_err in oof_df.columns:
-                err = oof_df[col_err].values
-                features[f'conf_{name}'] = 1.0 - np.clip(err, 0.0, 1.0)
+        # Context features (kept simple & robust)
+        ctx_df_tmp = pd.DataFrame(ctx_features)
+        for i, _ in enumerate(ctx_df_tmp.columns):
+            feats[f'ctx_{i}'] = ctx_features[:, i]
 
-        # Confidence-weighted aggregation (more robust than mean when specialists are unreliable)
-        conf_cols = [c for c in features.keys() if c.startswith('conf_')]
-        if conf_cols:
-            conf_mat = np.column_stack([features[c] for c in conf_cols])
-            conf_sum = np.maximum(1e-6, conf_mat.sum(axis=1))
-            features['conf_mean'] = conf_sum / conf_mat.shape[1]
-            # Align specialist order to conf columns order
-            spec_mat = spec_preds[:, :len(conf_cols)]
-            features['op_conf_weighted'] = (spec_mat * conf_mat).sum(axis=1) / conf_sum
-            features['conf_low_flag'] = (features['conf_mean'] < 0.6).astype(int)
-        
-        # 7. Context features
-        ctx_df = pd.DataFrame(ctx_features)
-        for i, col in enumerate(ctx_df.columns):
-            features[f'ctx_{i}'] = ctx_features[:, i]
-        
-        # 8. Protective factor interactions (if available)
-        ctx_cols = list(train_ctx.columns)
-        if 'pf_supervised_discharge' in ctx_cols:
-            pf_idx = ctx_cols.index('pf_supervised_discharge') - 1  # -1 for 'split'
-            if pf_idx >= 0 and pf_idx < ctx_features.shape[1]:
-                features['pf_complex_but_supervised'] = (
-                    (spec_preds[:, 1] > 0.6) & (ctx_features[:, pf_idx] == 1)
-                ).astype(int)
-        
-        return pd.DataFrame(features)
-    
-    X_train = build_doctor_features(spec_train, ctx_train, train_oof)
-    X_test = build_doctor_features(spec_test, ctx_test, test_oof)
-    
-    print(f"   Total features: {X_train.shape[1]}")
-    
-    # Train ensemble (CatBoost + LightGBM + XGBoost)
-    print("   Training ensemble (CatBoost + LightGBM + XGBoost)...")
-    
-    X_tr, X_val, y_tr, y_val = train_test_split(
-        X_train, y_train, test_size=0.15, stratify=y_train, random_state=RANDOM_STATE
+        # Confidence features (optional, but usually present)
+        if conf_features is not None:
+            for j in range(conf_features.shape[1]):
+                feats[f'conf_{j}'] = conf_features[:, j]
+            feats['conf_mean'] = np.mean(conf_features, axis=1)
+            feats['conf_min'] = np.min(conf_features, axis=1)
+            feats['conf_max'] = np.max(conf_features, axis=1)
+
+            # Confidence-weighted mean opinion (more robust than raw mean)
+            conf = np.clip(conf_features[:, :len(spec_names)], 1e-6, None)
+            conf = conf / conf.sum(axis=1, keepdims=True)
+            feats['op_conf_weighted'] = np.sum(spec_preds * conf, axis=1)
+
+        return pd.DataFrame(feats)
+
+    # Learn confidence features on train, infer on test
+    conf_train, conf_test = build_specialist_confidence_features(
+        spec_train, y_train, ctx_train_df, spec_test, ctx_test_df
     )
 
-    # Class imbalance handling (improves AUPRC in practice)
-    n_pos = max(1, int(y_tr.sum()))
-    n_neg = max(1, int((1 - y_tr).sum()))
+    X_train = build_doctor_features(spec_train, ctx_train, train_oof, conf_train)
+    X_test = build_doctor_features(spec_test, ctx_test, test_oof, conf_test)
+
+    print(f"   Total Doctor features: {X_train.shape[1]}")
+
+    # ----------------------------
+    # 3) Meta-learner with StratifiedKFold OOF (reduces split variance)
+    # ----------------------------
+    print("   Training ensemble with StratifiedKFold OOF...")
+
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+    oof_meta = np.zeros(len(X_train), dtype=np.float32)
+
+    for fold, (tr_idx, va_idx) in enumerate(skf.split(X_train, y_train), 1):
+        X_tr, X_val = X_train.iloc[tr_idx], X_train.iloc[va_idx]
+        y_tr, y_val = y_train[tr_idx], y_train[va_idx]
+
+        n_pos = max(1, int(y_tr.sum()))
+        n_neg = max(1, int((1 - y_tr).sum()))
+        pos_weight = n_neg / n_pos
+
+        # CatBoost
+        cat_model = CatBoostClassifier(
+            iterations=2000, learning_rate=0.01, depth=6,
+            l2_leaf_reg=8, min_data_in_leaf=30,
+            early_stopping_rounds=200, verbose=0, random_seed=RANDOM_STATE,
+            scale_pos_weight=pos_weight,
+            **GPU_PARAMS['catboost']
+        )
+        cat_model.fit(X_tr, y_tr, eval_set=(X_val, y_val))
+
+        # LightGBM
+        lgb_model = LGBMClassifier(
+            n_estimators=1500, learning_rate=0.01, max_depth=5,
+            min_child_samples=50, reg_lambda=5.0,
+            random_state=RANDOM_STATE, verbose=-1,
+            scale_pos_weight=pos_weight,
+            **GPU_PARAMS['lightgbm']
+        )
+        lgb_model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)])
+
+        # XGBoost (optimize for AUPRC signal)
+        xgb_model = XGBClassifier(
+            n_estimators=1500, learning_rate=0.01, max_depth=5,
+            min_child_weight=50, reg_lambda=5.0,
+            random_state=RANDOM_STATE, verbosity=0, use_label_encoder=False,
+            scale_pos_weight=pos_weight,
+            eval_metric='aucpr',
+            **GPU_PARAMS['xgboost']
+        )
+        xgb_model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
+
+        p_cat = cat_model.predict_proba(X_val)[:, 1]
+        p_lgb = lgb_model.predict_proba(X_val)[:, 1]
+        p_xgb = xgb_model.predict_proba(X_val)[:, 1]
+        oof_meta[va_idx] = (0.5 * p_cat + 0.25 * p_lgb + 0.25 * p_xgb).astype(np.float32)
+
+        fold_auc = roc_auc_score(y_val, oof_meta[va_idx])
+        fold_auprc = average_precision_score(y_val, oof_meta[va_idx])
+        print(f"      Fold {fold}/5: AUC={fold_auc:.4f}  AUPRC={fold_auprc:.4f}")
+
+    # ----------------------------
+    # 4) Calibrate final predictions using OOF (no leakage)
+    # ----------------------------
+    final_calibrator = IsotonicRegression(out_of_bounds='clip')
+    final_calibrator.fit(oof_meta, y_train)
+
+    oof_cal = final_calibrator.transform(oof_meta)
+    best_thresh = find_best_threshold_f1(y_train, oof_cal, thresh_min=0.03, thresh_max=0.5, step=0.01)
+    print(f"   Selected threshold (OOF, F1-opt): {best_thresh:.4f}")
+
+    # ----------------------------
+    # 5) Refit models on full train, predict test, calibrate, evaluate
+    # ----------------------------
+    n_pos = max(1, int(y_train.sum()))
+    n_neg = max(1, int((1 - y_train).sum()))
     pos_weight = n_neg / n_pos
-    
-    # CatBoost
+
     cat_model = CatBoostClassifier(
         iterations=2000, learning_rate=0.01, depth=6,
         l2_leaf_reg=8, min_data_in_leaf=30,
@@ -864,9 +874,6 @@ def run_arch0_baseline(train_oof, test_oof, train_ctx, test_ctx, df_train=None):
         scale_pos_weight=pos_weight,
         **GPU_PARAMS['catboost']
     )
-    cat_model.fit(X_tr, y_tr, eval_set=(X_val, y_val))
-    
-    # LightGBM
     lgb_model = LGBMClassifier(
         n_estimators=1500, learning_rate=0.01, max_depth=5,
         min_child_samples=50, reg_lambda=5.0,
@@ -874,36 +881,30 @@ def run_arch0_baseline(train_oof, test_oof, train_ctx, test_ctx, df_train=None):
         scale_pos_weight=pos_weight,
         **GPU_PARAMS['lightgbm']
     )
-    lgb_model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)])
-    
-    # XGBoost
     xgb_model = XGBClassifier(
         n_estimators=1500, learning_rate=0.01, max_depth=5,
         min_child_weight=50, reg_lambda=5.0,
         random_state=RANDOM_STATE, verbosity=0, use_label_encoder=False,
         scale_pos_weight=pos_weight,
+        eval_metric='aucpr',
         **GPU_PARAMS['xgboost']
     )
+
+    # A small internal split for early stopping only (keeps behavior close to original)
+    X_tr, X_val, y_tr, y_val = train_test_split(
+        X_train, y_train, test_size=0.10, stratify=y_train, random_state=RANDOM_STATE
+    )
+
+    cat_model.fit(X_tr, y_tr, eval_set=(X_val, y_val))
+    lgb_model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)])
     xgb_model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
-    
-    # Ensemble prediction
+
     p_cat = cat_model.predict_proba(X_test)[:, 1]
     p_lgb = lgb_model.predict_proba(X_test)[:, 1]
     p_xgb = xgb_model.predict_proba(X_test)[:, 1]
-    y_prob = 0.5 * p_cat + 0.25 * p_lgb + 0.25 * p_xgb
-    
-    # Calibrate final predictions
-    p_cat_val = cat_model.predict_proba(X_val)[:, 1]
-    p_lgb_val = lgb_model.predict_proba(X_val)[:, 1]
-    p_xgb_val = xgb_model.predict_proba(X_val)[:, 1]
-    y_prob_val = 0.5 * p_cat_val + 0.25 * p_lgb_val + 0.25 * p_xgb_val
-    
-    final_calibrator = IsotonicRegression(out_of_bounds='clip')
-    final_calibrator.fit(y_prob_val, y_val)
-    y_prob = final_calibrator.transform(y_prob)
-    
-    # Select threshold on validation set (prevents test leakage)
-    best_thresh = find_best_threshold_f1(y_val, y_prob_val)
+    y_prob_raw = 0.5 * p_cat + 0.25 * p_lgb + 0.25 * p_xgb
+
+    y_prob = final_calibrator.transform(y_prob_raw)
 
     return evaluate_predictions(y_test, y_prob, threshold=best_thresh)
 

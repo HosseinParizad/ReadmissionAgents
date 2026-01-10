@@ -496,7 +496,7 @@ class NoteSpecialist:
             max_iter=LDA_MAX_ITER,
             learning_method='online',
             random_state=RANDOM_STATE,
-            n_jobs=-1,
+            n_jobs=1,
             verbose=1  # Show LDA fitting progress
         )
         self.lda.fit(doc_term_matrix)
