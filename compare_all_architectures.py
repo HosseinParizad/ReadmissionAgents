@@ -785,6 +785,43 @@ def run_arch0_baseline(train_oof, test_oof, train_ctx, test_ctx, df_train=None):
         return pd.DataFrame(feats)
 
     # Learn confidence features on train, infer on test
+    def build_specialist_confidence_features(spec_train, y_train, ctx_train_df, spec_test, ctx_test_df):
+        """Train simple per-specialist confidence models and return train/test probs.
+
+        Uses a lightweight LogisticRegression per specialist on (spec_pred + context).
+        Returns two arrays: conf_train (n_train x n_specs), conf_test (n_test x n_specs).
+        """
+        from sklearn.linear_model import LogisticRegression
+
+        X_ctx_train = ctx_train_df.fillna(0).values
+        X_ctx_test = ctx_test_df.fillna(0).values
+
+        n_train = spec_train.shape[0]
+        n_test = spec_test.shape[0]
+        n_specs = spec_train.shape[1]
+
+        conf_train = np.zeros((n_train, n_specs), dtype=np.float32)
+        conf_test = np.zeros((n_test, n_specs), dtype=np.float32)
+
+        for i in range(n_specs):
+            try:
+                X_tr = np.column_stack([spec_train[:, i].reshape(-1, 1), X_ctx_train])
+                X_te = np.column_stack([spec_test[:, i].reshape(-1, 1), X_ctx_test])
+                y_flag = (y_train == 1).astype(int)
+
+                clf = LogisticRegression(max_iter=200, class_weight='balanced', solver='lbfgs')
+                clf.fit(X_tr, y_flag)
+
+                conf_train[:, i] = clf.predict_proba(X_tr)[:, 1]
+                conf_test[:, i] = clf.predict_proba(X_te)[:, 1]
+            except Exception:
+                # Fallback: use the raw specialist prediction as confidence
+                conf_train[:, i] = spec_train[:, i]
+                conf_test[:, i] = spec_test[:, i]
+
+        return conf_train, conf_test
+
+
     conf_train, conf_test = build_specialist_confidence_features(
         spec_train, y_train, ctx_train_df, spec_test, ctx_test_df
     )
@@ -984,7 +1021,8 @@ def run_arch1_moe(train_oof, test_oof, train_ctx, test_ctx):
     y_prob = model.predict_proba(X_test)[:, 1]
     
     calibrator = IsotonicRegression(out_of_bounds='clip')
-    calibrator.fit(model.predict_proba(X_val)[:, 1], y_val)
+    y_prob_val = model.predict_proba(X_val)[:, 1]
+    calibrator.fit(y_prob_val, y_val)
     y_prob = calibrator.transform(y_prob)
     
     # Select threshold on validation set (prevents test leakage)
@@ -1179,7 +1217,8 @@ def run_arch3_gnn(train_oof, test_oof, train_ctx, test_ctx):
     y_prob = model.predict_proba(X_test)[:, 1]
     
     calibrator = IsotonicRegression(out_of_bounds='clip')
-    calibrator.fit(model.predict_proba(X_val)[:, 1], y_val)
+    y_prob_val = model.predict_proba(X_val)[:, 1]
+    calibrator.fit(y_prob_val, y_val)
     y_prob = calibrator.transform(y_prob)
     
     # Select threshold on validation set (prevents test leakage)
@@ -1256,7 +1295,8 @@ def run_arch4_transformer(train_oof, test_oof, train_ctx, test_ctx):
     y_prob = model.predict_proba(X_test)[:, 1]
     
     calibrator = IsotonicRegression(out_of_bounds='clip')
-    calibrator.fit(model.predict_proba(X_val)[:, 1], y_val)
+    y_prob_val = model.predict_proba(X_val)[:, 1]
+    calibrator.fit(y_prob_val, y_val)
     y_prob = calibrator.transform(y_prob)
     
     # Select threshold on validation set (prevents test leakage)
@@ -1340,7 +1380,8 @@ def run_arch5_clinical_reasoning(train_oof, test_oof, train_ctx, test_ctx):
     y_prob = model.predict_proba(X_test)[:, 1]
     
     calibrator = IsotonicRegression(out_of_bounds='clip')
-    calibrator.fit(model.predict_proba(X_val)[:, 1], y_val)
+    y_prob_val = model.predict_proba(X_val)[:, 1]
+    calibrator.fit(y_prob_val, y_val)
     y_prob = calibrator.transform(y_prob)
     
     # Select threshold on validation set (prevents test leakage)
@@ -1415,6 +1456,11 @@ def run_arch6_temporal(train_oof, test_oof, train_ctx, test_ctx, df_train, df_te
     
     # Train trajectory specialist
     print("   Training trajectory specialist...")
+    # Class imbalance handling for trajectory specialist
+    n_pos = max(1, int(y_train.sum()))
+    n_neg = max(1, int((1 - y_train).sum()))
+    pos_weight = n_neg / n_pos
+
     traj_model = CatBoostClassifier(
         iterations=500, learning_rate=0.03, depth=4,
         verbose=0, random_seed=RANDOM_STATE,
@@ -1450,7 +1496,8 @@ def run_arch6_temporal(train_oof, test_oof, train_ctx, test_ctx, df_train, df_te
     y_prob = model.predict_proba(X_test)[:, 1]
     
     calibrator = IsotonicRegression(out_of_bounds='clip')
-    calibrator.fit(model.predict_proba(X_val)[:, 1], y_val)
+    y_prob_val = model.predict_proba(X_val)[:, 1]
+    calibrator.fit(y_prob_val, y_val)
     y_prob = calibrator.transform(y_prob)
     
     # Select threshold on validation set (prevents test leakage)
