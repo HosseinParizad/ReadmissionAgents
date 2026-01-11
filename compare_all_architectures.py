@@ -683,6 +683,73 @@ def evaluate_predictions(y_true: np.ndarray, y_prob: np.ndarray, threshold: floa
     }
 
 
+def save_predictions_with_features(
+    arch_num: int,
+    arch_name: str,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_prob: np.ndarray,
+    test_oof: pd.DataFrame,
+    test_ctx: pd.DataFrame,
+    output_dir: str = './model_outputs/failure_analysis/'
+) -> None:
+    """Save predictions with features for failure analysis.
+    
+    Args:
+        arch_num: Architecture number (0-6)
+        arch_name: Architecture name (e.g., 'IMSE')
+        y_true: True labels
+        y_pred: Predicted labels
+        y_prob: Predicted probabilities
+        test_oof: Test OOF DataFrame with specialist opinions
+        test_ctx: Test context DataFrame with clinical features
+        output_dir: Output directory for predictions
+    """
+    # Create output directory
+    arch_dir = os.path.join(output_dir, f'arch{arch_num}_{arch_name}')
+    os.makedirs(arch_dir, exist_ok=True)
+    
+    # Build predictions DataFrame
+    predictions_df = pd.DataFrame({
+        'y_true': y_true,
+        'y_pred': y_pred,
+        'y_prob': y_prob,
+    })
+    
+    # Add specialist opinions from test_oof
+    specialist_cols = ['op_lab', 'op_note', 'op_pharm', 'op_hist', 'op_psych']
+    for col in specialist_cols:
+        if col in test_oof.columns:
+            predictions_df[col] = test_oof[col].values
+    
+    # Add psychosocial sub-scores if available
+    psych_sub_cols = ['op_psych_mental', 'op_psych_care', 'op_psych_social']
+    for col in psych_sub_cols:
+        if col in test_oof.columns:
+            predictions_df[col] = test_oof[col].values
+    
+    # Add specialist statistics
+    if all(col in predictions_df.columns for col in specialist_cols):
+        spec_array = predictions_df[specialist_cols].values
+        predictions_df['op_mean'] = np.mean(spec_array, axis=1)
+        predictions_df['op_std'] = np.std(spec_array, axis=1)
+        predictions_df['op_max'] = np.max(spec_array, axis=1)
+        predictions_df['op_min'] = np.min(spec_array, axis=1)
+    
+    # Add context features from test_ctx
+    ctx_cols = [c for c in test_ctx.columns if c != 'split']
+    for col in ctx_cols:
+        if col in test_ctx.columns:
+            predictions_df[col] = test_ctx[col].values
+    
+    # Save to CSV
+    output_file = os.path.join(arch_dir, 'predictions_with_features.csv')
+    predictions_df.to_csv(output_file, index=False)
+    
+    print(f"   💾 Saved predictions to: {output_file}")
+    print(f"      Columns: {len(predictions_df.columns)}, Rows: {len(predictions_df)}")
+
+
 # =============================================================================
 # ARCHITECTURE 0: BASELINE (IMSE) - Your Current Model
 # =============================================================================
@@ -942,8 +1009,11 @@ def run_arch0_baseline(train_oof, test_oof, train_ctx, test_ctx, df_train=None):
     y_prob_raw = 0.5 * p_cat + 0.25 * p_lgb + 0.25 * p_xgb
 
     y_prob = final_calibrator.transform(y_prob_raw)
+    y_pred = (y_prob >= best_thresh).astype(int)
 
-    return evaluate_predictions(y_test, y_prob, threshold=best_thresh)
+    results = evaluate_predictions(y_test, y_prob, threshold=best_thresh)
+    return results, y_pred, y_prob
+
 
 
 # =============================================================================
@@ -1027,8 +1097,10 @@ def run_arch1_moe(train_oof, test_oof, train_ctx, test_ctx):
     
     # Select threshold on validation set (prevents test leakage)
     best_thresh = find_best_threshold_f1(y_val, y_prob_val)
+    y_pred = (y_prob >= best_thresh).astype(int)
 
-    return evaluate_predictions(y_test, y_prob, threshold=best_thresh)
+    results = evaluate_predictions(y_test, y_prob, threshold=best_thresh)
+    return results, y_pred, y_prob
 
 
 # =============================================================================
@@ -1128,13 +1200,16 @@ def run_arch2_debate(train_oof, test_oof, train_ctx, test_ctx):
     y_prob = resolver.predict_proba(X_test)[:, 1]
     
     calibrator = IsotonicRegression(out_of_bounds='clip')
-    calibrator.fit(resolver.predict_proba(X_val)[:, 1], y_val)
+    y_prob_val = resolver.predict_proba(X_val)[:, 1]
+    calibrator.fit(y_prob_val, y_val)
     y_prob = calibrator.transform(y_prob)
     
     # Select threshold on validation set (prevents test leakage)
     best_thresh = find_best_threshold_f1(y_val, y_prob_val)
+    y_pred = (y_prob >= best_thresh).astype(int)
 
-    return evaluate_predictions(y_test, y_prob, threshold=best_thresh)
+    results = evaluate_predictions(y_test, y_prob, threshold=best_thresh)
+    return results, y_pred, y_prob
 
 
 # =============================================================================
@@ -1223,8 +1298,10 @@ def run_arch3_gnn(train_oof, test_oof, train_ctx, test_ctx):
     
     # Select threshold on validation set (prevents test leakage)
     best_thresh = find_best_threshold_f1(y_val, y_prob_val)
+    y_pred = (y_prob >= best_thresh).astype(int)
 
-    return evaluate_predictions(y_test, y_prob, threshold=best_thresh)
+    results = evaluate_predictions(y_test, y_prob, threshold=best_thresh)
+    return results, y_pred, y_prob
 
 
 # =============================================================================
@@ -1301,8 +1378,10 @@ def run_arch4_transformer(train_oof, test_oof, train_ctx, test_ctx):
     
     # Select threshold on validation set (prevents test leakage)
     best_thresh = find_best_threshold_f1(y_val, y_prob_val)
+    y_pred = (y_prob >= best_thresh).astype(int)
 
-    return evaluate_predictions(y_test, y_prob, threshold=best_thresh)
+    results = evaluate_predictions(y_test, y_prob, threshold=best_thresh)
+    return results, y_pred, y_prob
 
 
 # =============================================================================
@@ -1386,8 +1465,11 @@ def run_arch5_clinical_reasoning(train_oof, test_oof, train_ctx, test_ctx):
     
     # Select threshold on validation set (prevents test leakage)
     best_thresh = find_best_threshold_f1(y_val, y_prob_val)
+    y_pred = (y_prob >= best_thresh).astype(int)
 
-    return evaluate_predictions(y_test, y_prob, threshold=best_thresh)
+    results = evaluate_predictions(y_test, y_prob, threshold=best_thresh)
+    return results, y_pred, y_prob
+
 
 
 # =============================================================================
@@ -1502,8 +1584,11 @@ def run_arch6_temporal(train_oof, test_oof, train_ctx, test_ctx, df_train, df_te
     
     # Select threshold on validation set (prevents test leakage)
     best_thresh = find_best_threshold_f1(y_val, y_prob_val)
+    y_pred = (y_prob >= best_thresh).astype(int)
 
-    return evaluate_predictions(y_test, y_prob, threshold=best_thresh)
+    results = evaluate_predictions(y_test, y_prob, threshold=best_thresh)
+    return results, y_pred, y_prob
+
 
 
 # =============================================================================
@@ -1614,12 +1699,13 @@ def run_full_comparison(arch_nums: List[int], skip_specialist_training: bool = F
         name, func = arch_funcs[arch_num]
         print(f"\nRunning Architecture {arch_num}: {name}...")
         try:
+            # Call architecture function and capture predictions
             if arch_num == 0:
-                results = func(train_oof, test_oof, train_ctx, test_ctx, df_train)
+                results, y_pred, y_prob = func(train_oof, test_oof, train_ctx, test_ctx, df_train)
             elif arch_num == 6:
-                results = func(train_oof, test_oof, train_ctx, test_ctx, df_train, df_test)
+                results, y_pred, y_prob = func(train_oof, test_oof, train_ctx, test_ctx, df_train, df_test)
             else:
-                results = func(train_oof, test_oof, train_ctx, test_ctx)
+                results, y_pred, y_prob = func(train_oof, test_oof, train_ctx, test_ctx)
             
             results['arch_num'] = arch_num
             results['short_name'] = name
@@ -1628,6 +1714,18 @@ def run_full_comparison(arch_nums: List[int], skip_specialist_training: bool = F
             all_results.append(results)
             
             print(f"   ✅ {name}: AUC = {results['auc']:.4f}, F1 = {results['f1']:.4f}")
+            
+            # Save predictions with features for failure analysis
+            y_test = test_oof['y_true'].values
+            save_predictions_with_features(
+                arch_num=arch_num,
+                arch_name=ARCHITECTURE_NAMES[arch_num]['abbrev'],
+                y_true=y_test,
+                y_pred=y_pred,
+                y_prob=y_prob,
+                test_oof=test_oof,
+                test_ctx=test_ctx
+            )
             
         except Exception as e:
             print(f"   ❌ {name}: {e}")
