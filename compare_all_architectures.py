@@ -564,6 +564,8 @@ def train_specialists_and_save_oof(df_train: pd.DataFrame, df_test: pd.DataFrame
     
     # Create DataFrames
     train_oof_df = pd.DataFrame({
+        'hadm_id': df_train['hadm_id'].values if 'hadm_id' in df_train.columns else np.zeros(len(df_train)),
+        'subject_id': df_train['subject_id'].values if 'subject_id' in df_train.columns else np.zeros(len(df_train)),
         'y_true': y_train,
         'op_lab': oof_train['lab'],
         'op_note': oof_train['note'],
@@ -577,6 +579,8 @@ def train_specialists_and_save_oof(df_train: pd.DataFrame, df_test: pd.DataFrame
     })
     
     test_oof_df = pd.DataFrame({
+        'hadm_id': df_test['hadm_id'].values if 'hadm_id' in df_test.columns else np.zeros(len(df_test)),
+        'subject_id': df_test['subject_id'].values if 'subject_id' in df_test.columns else np.zeros(len(df_test)),
         'y_true': y_test,
         'op_lab': oof_test['lab'],
         'op_note': oof_test['note'],
@@ -1656,6 +1660,21 @@ def run_full_comparison(arch_nums: List[int], skip_specialist_training: bool = F
     if skip_specialist_training and os.path.exists(oof_path):
         print("\n⏭️ Skipping specialist training, loading cached OOF predictions...")
         train_oof, test_oof, train_ctx, test_ctx = load_shared_data()
+        
+        # Retroactive ID Injection for Explainability
+        if 'hadm_id' not in train_oof.columns and 'hadm_id' in df_train.columns:
+             if len(train_oof) == len(df_train):
+                 print("   ⚠️ Injecting missing hadm_id/subject_id into cached train_oof...")
+                 train_oof['hadm_id'] = df_train['hadm_id'].values
+                 if 'subject_id' in df_train.columns:
+                     train_oof['subject_id'] = df_train['subject_id'].values
+        
+        if 'hadm_id' not in test_oof.columns and 'hadm_id' in df_test.columns:
+             if len(test_oof) == len(df_test):
+                 print("   ⚠️ Injecting missing hadm_id/subject_id into cached test_oof...")
+                 test_oof['hadm_id'] = df_test['hadm_id'].values
+                 if 'subject_id' in df_test.columns:
+                     test_oof['subject_id'] = df_test['subject_id'].values
     else:
         # Use fewer folds for debug/half-data to speed it up
         if debug:

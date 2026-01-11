@@ -108,12 +108,159 @@ ERROR_PATTERNS = {
         'description': 'High variance in specialist opinions',
         'condition': lambda row: row.get('op_std', 0) > 0.25 and row['y_pred'] == 0 and row['y_true'] == 1
     },
+    'fn_specialist_disagreement': {
+        'name': 'Specialist Disagreement',
+        'description': 'High variance in specialist opinions',
+        'condition': lambda row: row.get('op_std', 0) > 0.25 and row['y_pred'] == 0 and row['y_true'] == 1
+    },
 }
 
+# =============================================================================
+# EXPLAINABILITY EXTRACTOR
+# =============================================================================
+class ExplainabilityExtractor:
+    """Extracts interpretable features from raw data for failure analysis."""
+    
+    def __init__(self):
+        import re
+        self.re = re
+        
+        # Expanded Keywords
+        self.keywords = {
+            'ACUTE_EVENT': [
+                'unstable', 'critical', 'sepsis', 'septic', 'shock', 'intubated', 
+                'respiratory failure', 'cardiac arrest', 'code blue', 'hypotension',
+                'hypoxia', 'altered mental status', 'unresponsive', 'coma', 'bleed',
+                'hemorrhage', 'stemi', 'nstem', 'infarction', 'stroke', 'cva'
+            ],
+            'PRIOR_UTILIZATION': [
+                'readmission', 'frequent flyer', 'multiple admission', 'recent discharge',
+                'return to ed', 'bounce back', 're-presentation', 'non-compliant'
+            ],
+            'SOCIAL_RISK': [
+                'homeless', 'undomiciled', 'shelter', 'substance', 'alcohol', 'etoh',
+                'cocaine', 'heroin', 'overdose', 'withdrawal', 'social work',
+                'lives alone', 'no support', 'financial', 'insurance', 'lack of transportation'
+            ],
+            'COMPLEXITY': [
+                'multisystem', 'transplant', 'dialysis', 'esrd', 'metastatic', 'cancer',
+                'immunosuppressed', 'hospice', 'palliative', 'dnr/dni', 'comfort care',
+                'total care', 'bedbound', 'gastrostomy', 'tracheostomy'
+            ],
+            'PROTECTIVE': [
+                'stable', 'improved', 'improving', 'tolerating', 'weaned',
+                'ambulatory', 'independent', 'self-care', 'alert and oriented',
+                'participating', 'family at bedside', 'involved family', 
+                'lives with spouse', 'lives with family', 'home health', 'vna',
+                'follow-up arranged', 'appointment scheduled', 'rehabilitation', 
+                'snf', 'skilled nursing', 'compliant', 'good understanding'
+            ]
+        }
+        
+    def analyze_note(self, text: str) -> Dict[str, any]:
+        """Analyze clinical note text for keywords."""
+        if not isinstance(text, str) or pd.isna(text):
+            return {}
+            
+        text_lower = text.lower()
+        results = {}
+        
+        # Count keywords
+        for category, words in self.keywords.items():
+            found = [w for w in words if w in text_lower]
+            results[f'kw_{category}_count'] = len(found)
+            results[f'kw_{category}_found'] = found[:3] 
+            
+        return results
+        
+    def generate_note_explanation(self, score: float, analysis: Dict, case: pd.Series) -> str:
+        """Generate text explanation for note score using text and metadata."""
+        explanation = []
+        
+        if score > 0.65:
+            # Explain HIGH score
+            # 1. Check Keywords (most important - actual text content)
+            keyword_explanations = []
+            
+            if analysis.get('kw_ACUTE_EVENT_count', 0) > 0:
+                words = ", ".join(analysis['kw_ACUTE_EVENT_found'][:3])
+                keyword_explanations.append(f"acute instability indicators ({words})")
+            
+            if analysis.get('kw_SOCIAL_RISK_count', 0) > 0:
+                words = ", ".join(analysis['kw_SOCIAL_RISK_found'][:3])
+                keyword_explanations.append(f"social/behavioral risk factors ({words})")
+                
+            if analysis.get('kw_PRIOR_UTILIZATION_count', 0) > 0:
+                words = ", ".join(analysis['kw_PRIOR_UTILIZATION_found'][:3])
+                keyword_explanations.append(f"prior utilization patterns ({words})")
 
-# =============================================================================
-# FAILURE ANALYZER
-# =============================================================================
+            if analysis.get('kw_COMPLEXITY_count', 0) > 0:
+                words = ", ".join(analysis['kw_COMPLEXITY_found'][:3])
+                keyword_explanations.append(f"multisystem complexity ({words})")
+            
+            # If we found keywords, that's the primary explanation
+            if keyword_explanations:
+                explanation.append(f"Clinical notes document: {'; '.join(keyword_explanations)}")
+            else:
+                # 2. Fallback: Explain via metadata + what ClinicalBERT likely detected
+                context_signals = []
+                
+                if case.get('n_diagnoses', 0) > 25:
+                    context_signals.append(f"{int(case['n_diagnoses'])} diagnoses suggesting complex multimorbidity")
+                if case.get('n_medications', 0) > 20:
+                    context_signals.append(f"{int(case['n_medications'])} medications indicating polypharmacy")
+                if case.get('los_days', 0) > 10:
+                    context_signals.append(f"{case['los_days']:.1f}-day stay suggesting complicated course")
+                if case.get('charlson_score', 0) > 6:
+                    context_signals.append(f"Charlson score {int(case['charlson_score'])} (severe comorbidity burden)")
+                if case.get('emergency_admission', 0) == 1:
+                    context_signals.append("emergency admission")
+                    
+                if context_signals:
+                    # More specific explanation of what the model detected
+                    explanation.append(
+                        f"ClinicalBERT embeddings + manual features detected high-risk patterns. "
+                        f"Clinical context: {'; '.join(context_signals[:2])}. "
+                        f"Likely captured: treatment intensity, care transitions, or latent clinical deterioration markers in note language"
+                    )
+                else:
+                    explanation.append(
+                        "ClinicalBERT detected high-risk language patterns in notes "
+                        "(e.g., urgent tone, treatment escalation terminology, or coded references to instability) "
+                        "not captured by explicit keywords"
+                    )
+                    
+        else:
+            # Explain LOW score
+            protective_explanations = []
+            
+            if analysis.get('kw_PROTECTIVE_count', 0) > 0:
+                words = ", ".join(analysis['kw_PROTECTIVE_found'][:3])
+                protective_explanations.append(f"stability indicators ({words})")
+            
+            if protective_explanations:
+                explanation.append(f"Clinical notes emphasize: {'; '.join(protective_explanations)}")
+            else:
+                # Explain why low
+                if case.get('n_diagnoses', 0) < 10 and case.get('los_days', 0) < 3:
+                    explanation.append(
+                        f"Note language consistent with uncomplicated course "
+                        f"({int(case.get('n_diagnoses', 0))} diagnoses, {case.get('los_days', 0):.1f}-day stay). "
+                        f"ClinicalBERT likely detected: routine discharge terminology, absence of complication markers"
+                    )
+                else:
+                    explanation.append(
+                        "Despite moderate clinical complexity, note language emphasizes stability. "
+                        "ClinicalBERT likely detected: positive progress descriptors, successful treatment markers, "
+                        "or planned/controlled discharge language rather than urgent/unplanned terminology"
+                    )
+                
+        return "; ".join(explanation)
+
+
+
+
+
 class FailureAnalyzer:
     """Comprehensive failure analysis for readmission prediction models."""
     
@@ -135,25 +282,116 @@ class FailureAnalyzer:
         self.error_patterns = {}
     
     def load_predictions(self, predictions_file: str) -> pd.DataFrame:
-        """Load predictions from architecture output.
+        """Load predictions and merge with original text data.
         
         Args:
             predictions_file: Path to predictions CSV
             
         Returns:
-            DataFrame with predictions and features
+            DataFrame with predictions, features, and text
         """
         if not os.path.exists(predictions_file):
             raise FileNotFoundError(f"Predictions file not found: {predictions_file}")
-        
+            
+        # 1. Load predictions
         df = pd.read_csv(predictions_file)
         
         # Ensure required columns exist
         required = ['y_true', 'y_pred', 'y_prob']
         if not all(col in df.columns for col in required):
             raise ValueError(f"Missing required columns: {required}")
-        
+            
+        # 2. Load original data for text
+        try:
+            print("   Loading original data for text analysis...")
+            orig_df = pd.read_csv(DATA_PATH)
+            
+            # Check for identifiers
+            if 'hadm_id' in df.columns and 'hadm_id' in orig_df.columns:
+                # Merge on hadm_id
+                cols_to_merge = ['hadm_id', 'clinical_text']
+                if 'subject_id' in orig_df.columns and 'subject_id' not in df.columns:
+                    cols_to_merge.append('subject_id')
+                
+                print("   Merging predictions with clinical text...")
+                df = df.merge(orig_df[cols_to_merge], on='hadm_id', how='left')
+                
+            else:
+                print("   ⚠️ Identifiers (hadm_id) not found in predictions. Skipping text merge.")
+                df['clinical_text'] = ""
+                
+        except Exception as e:
+            print(f"   ⚠️ Failed to load original data: {e}")
+            df['clinical_text'] = ""
+            
         return df
+    
+    def generate_case_report(self, case: pd.Series, error_type: str) -> str:
+        """Generate detailed human-readable report for a single case."""
+        report = []
+        extractor = ExplainabilityExtractor()
+        
+        # Analyze text if available
+        text_analysis = extractor.analyze_note(case.get('clinical_text', ''))
+        
+        report.append(f"CASE REPORT: {error_type}")
+        report.append("-" * 40)
+        report.append(f"Subject ID:  {case.get('subject_id', 'N/A')}")
+        report.append(f"HADM ID:     {case.get('hadm_id', 'N/A')}")
+        report.append(f"Indices:     Row {case.name}")
+        report.append("")
+        
+        report.append("[MODEL PREDICTION]")
+        risk_level = self.classify_risk_level(case['y_prob'])
+        report.append(f"   Prediction:  {'READMIT' if case['y_pred']==1 else 'NO READMIT'}")
+        report.append(f"   Probability: {case['y_prob']:.2%}  [{risk_level}]")
+        report.append(f"   Actual:      {'READMIT' if case['y_true']==1 else 'NO READMIT'}")
+        report.append("")
+        
+        if 'uncertainty_threshold' in case.index:
+            lower = case.get('y_lower', case['y_prob'])
+            upper = case.get('y_upper', case['y_prob'])
+            report.append(f"   Uncertainty: {lower:.2%} - {upper:.2%}")
+            report.append("")
+            
+        report.append("[BRAIN] SPECIALIST OPINIONS:")
+        specialists = [
+            ('Lab Specialist', case.get('op_lab', 0), 'lab'),
+            ('Note Specialist', case.get('op_note', 0), 'note'),
+            ('Pharmacy Specialist', case.get('op_pharm', 0), 'pharm'),
+            ('History Specialist', case.get('op_hist', 0), 'hist'),
+            ('Psychosocial Specialist', case.get('op_psych', 0), 'psych'),
+        ]
+        
+        for name, prob, spec_type in specialists:
+            level = self.classify_specialist_opinion(prob)
+            explanation = ""
+            
+            # Add specific explanations
+            if spec_type == 'note':
+                explanation = extractor.generate_note_explanation(prob, text_analysis)
+                if explanation:
+                    explanation = f"\n      ↳ WHY: {explanation}"
+            
+            report.append(f"   {name:25s} {prob:.2%}  [{level}]{explanation}")
+        
+        # Psychosocial sub-scores
+        if 'op_psych_mental' in case.index:
+            report.append("")
+            report.append("   Psychosocial Sub-Scores:")
+            report.append(f"      Mental Health:    {case.get('op_psych_mental', 0):.2%}")
+            
+            # Explain Social Support
+            social_analysis = ""
+            if text_analysis.get('social_negative'):
+                social_analysis = f" (neg: {', '.join(text_analysis['social_negative'][:2])})"
+            elif text_analysis.get('social_positive'):
+                social_analysis = f" (pos: {', '.join(text_analysis['social_positive'][:2])})"
+                
+            report.append(f"      Social Support:   {case.get('op_psych_social', 0):.2%}{social_analysis}")
+            report.append(f"      Care Support:     {case.get('op_psych_care', 0):.2%}")
+
+        return "\n".join(report)
     
     def classify_risk_level(self, prob: float) -> str:
         """Classify probability into risk level.
@@ -305,6 +543,11 @@ class FailureAnalyzer:
             Formatted case report string
         """
         report = []
+        extractor = ExplainabilityExtractor()
+        
+        # Analyze text if available
+        text_analysis = extractor.analyze_note(case.get('clinical_text', ''))
+        
         report.append("=" * 80)
         report.append(f"CASE #{case_num} - HADM_ID: {case.get('hadm_id', 'UNKNOWN')}")
         report.append(f"ERROR TYPE: {error_type}")
@@ -318,6 +561,10 @@ class FailureAnalyzer:
         report.append(f"   Predicted Label:   {'READMITTED' if case['y_pred'] == 1 else 'NOT READMITTED'}")
         report.append(f"   Actual Outcome:    {'READMITTED' if case['y_true'] == 1 else 'NOT READMITTED'}")
         report.append(f"   Prediction:        {'✓ CORRECT' if case['y_pred'] == case['y_true'] else '✗ INCORRECT'}")
+        if 'uncertainty_threshold' in case.index:
+            lower = case.get('y_lower', case['y_prob'])
+            upper = case.get('y_upper', case['y_prob'])
+            report.append(f"   Uncertainty Range: {lower:.2%} - {upper:.2%}")
         report.append("")
         
         # Patient context
@@ -349,24 +596,42 @@ class FailureAnalyzer:
         if 'op_lab' in case.index:
             report.append("[BRAIN] SPECIALIST OPINIONS:")
             specialists = [
-                ('Lab Specialist', case.get('op_lab', 0)),
-                ('Note Specialist', case.get('op_note', 0)),
-                ('Pharmacy Specialist', case.get('op_pharm', 0)),
-                ('History Specialist', case.get('op_hist', 0)),
-                ('Psychosocial Specialist', case.get('op_psych', 0)),
+                ('Lab Specialist', case.get('op_lab', 0), 'lab'),
+                ('Note Specialist', case.get('op_note', 0), 'note'),
+                ('Pharmacy Specialist', case.get('op_pharm', 0), 'pharm'),
+                ('History Specialist', case.get('op_hist', 0), 'hist'),
+                ('Psychosocial Specialist', case.get('op_psych', 0), 'psych'),
             ]
             
-            for name, prob in specialists:
+            for name, prob, spec_type in specialists:
                 level = self.classify_specialist_opinion(prob)
-                report.append(f"   {name:25s} {prob:.2%}  [{level}]")
+                explanation = ""
+                
+                # Add specific explanations
+                if spec_type == 'note':
+                    explanation = extractor.generate_note_explanation(prob, text_analysis, case)
+                    if explanation:
+                        explanation = f"\n      ↳ WHY: {explanation}"
+                        
+                report.append(f"   {name:25s} {prob:.2%}  [{level}]{explanation}")
             
             # Psychosocial sub-scores
             if 'op_psych_mental' in case.index:
                 report.append("")
                 report.append("   Psychosocial Sub-Scores:")
                 report.append(f"      Mental Health:    {case.get('op_psych_mental', 0):.2%}")
+                
+                # Explain Social Support
+                social_analysis = ""
+                if text_analysis.get('social_negative'):
+                    social_analysis = f" (neg: {', '.join(text_analysis['social_negative'][:2])})"
+                elif text_analysis.get('social_positive'):
+                    social_analysis = f" (pos: {', '.join(text_analysis['social_positive'][:2])})"
+                    
+                report.append(f"      Social Support:   {case.get('op_psych_social', 0):.2%}{social_analysis}")
+                
+                # Add Care Support
                 report.append(f"      Care Support:     {case.get('op_psych_care', 0):.2%}")
-                report.append(f"      Social Support:   {case.get('op_psych_social', 0):.2%}")
             
             # Agreement
             if 'op_std' in case.index:
@@ -392,6 +657,10 @@ class FailureAnalyzer:
                 protective.append("scheduled followup")
             if case.get('pf_family_support', 0) == 1:
                 protective.append("family support")
+            
+            # Add text-based protective explanations
+            if text_analysis.get('kw_PROTECTIVE_count', 0) > 2:
+                protective.append("strong stability keywords in notes")
             
             if protective:
                 report.append(f"   • Protective factors present: {', '.join(protective)}")
@@ -427,6 +696,10 @@ class FailureAnalyzer:
             # Check low risk indicators
             if case.get('y_prob', 1.0) < 0.15:
                 report.append("   • Very low predicted probability - may be edge case")
+                
+            # Check text indicators for missing risk
+            if text_analysis.get('kw_HIGH_RISK_count', 0) > 0:
+                report.append(f"   • Missed high-risk keywords in notes: {', '.join(text_analysis['kw_HIGH_RISK_found'])}")
         
         report.append("")
         report.append("=" * 80)
@@ -521,6 +794,16 @@ class FailureAnalyzer:
             f.write(f"Total Cases: {len(self.df_full):,}\n")
             f.write(f"False Positives: {len(self.fp_cases):,} | False Negatives: {len(self.fn_cases):,}\n")
             f.write("="*80 + "\n\n")
+
+            # Methodology
+            f.write("METHODOLOGY NOTE:\n")
+            f.write("-" * 80 + "\n")
+            f.write("Specialist scores are derived from multi-modal analysis:\n")
+            f.write("   • Note Specialist:  Ensemble of ClinicalBERT Embeddings + LDA Topics + Manual Features (Structure, Risk Patterns)\n")
+            f.write("                        processed by HistGradientBoostingClassifier.\n")
+            f.write("   • Lab Specialist:   Dynamic Lab Trajectories (RNN/Transformer)\n")
+            f.write("   • High 'Why' explanations are heuristic interpretations of the black-box score.\n")
+            f.write("=" * 80 + "\n\n")
             
             # Error Patterns
             f.write("IDENTIFIED ERROR PATTERNS:\n")
