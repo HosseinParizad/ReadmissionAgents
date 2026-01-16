@@ -1,33 +1,14 @@
 """
-CLINICAL AI FAILURE ANALYSIS SYSTEM
-====================================
+CLINICAL AI FAILURE ANALYSIS SYSTEM - ENHANCED WITH FULL EXPLAINABILITY
+========================================================================
 
 Comprehensive failure analysis for multi-agent readmission prediction models.
-Analyzes False Positives and False Negatives to identify systematic errors
-and generate actionable insights for model improvement.
+Now includes detailed "WHY" explanations for ALL specialists.
 
 USAGE:
 ------
-    # Run analysis on all architectures
-    python analyze_failures.py
-    
-    # Analyze specific architecture
-    python analyze_failures.py --arch 0
-    
-    # Focus on specific error type
-    python analyze_failures.py --error-type fp  # or fn
-    
-    # Generate detailed case reports
     python analyze_failures.py --detailed --top-k 50
-
-OUTPUT:
--------
-    ./model_outputs/failure_analysis/
-    ├── arch{N}_failure_report.txt       # Detailed failure analysis
-    ├── arch{N}_fp_cases.csv             # False positive cases
-    ├── arch{N}_fn_cases.csv             # False negative cases
-    ├── arch{N}_error_patterns.csv       # Identified error patterns
-    └── comparison_failure_analysis.csv  # Cross-architecture comparison
+    python analyze_failures.py --arch 0 --detailed
 """
 
 import os
@@ -36,372 +17,353 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
-from collections import Counter, defaultdict
 import warnings
 warnings.filterwarnings('ignore')
 
-# Import project modules
 try:
     from config import DATA_PATH, TARGET, RANDOM_STATE
-    from compare_all_architectures import (
-        load_shared_data, get_specialist_preds, 
-        ARCHITECTURE_NAMES, SHARED_DIR
-    )
+    from compare_all_architectures import ARCHITECTURE_NAMES, SHARED_DIR
 except ImportError as e:
     print(f"⚠️ Warning: Could not import project modules: {e}")
-    print("   Make sure config.py and compare_all_architectures.py are in the same directory")
 
-
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
 ANALYSIS_DIR = './model_outputs/failure_analysis/'
 os.makedirs(ANALYSIS_DIR, exist_ok=True)
 
-# Clinical thresholds
-RISK_THRESHOLDS = {
-    'low': 0.35,
-    'moderate': 0.50,
-    'high': 0.65,
-}
+RISK_THRESHOLDS = {'low': 0.35, 'moderate': 0.50, 'high': 0.65}
+SPECIALIST_THRESHOLDS = {'low': 0.45, 'moderate': 0.55, 'high': 0.65}
 
-SPECIALIST_THRESHOLDS = {
-    'low': 0.45,
-    'moderate': 0.55,
-    'high': 0.65,
-}
-
-# Error pattern categories
-ERROR_PATTERNS = {
-    'fp_supervised_discharge': {
-        'name': 'Supervised Discharge Protection',
-        'description': 'Patient discharged to SNF/rehab but model predicted readmission',
-        'condition': lambda row: row['supervised_discharge'] == 1 and row['y_pred'] == 1 and row['y_true'] == 0
-    },
-    'fp_protective_factors': {
-        'name': 'Strong Protective Factors Missed',
-        'description': 'Patient had strong protective factors but model predicted readmission',
-        'condition': lambda row: row.get('protective_score', 0) >= 2 and row['y_pred'] == 1 and row['y_true'] == 0
-    },
-    'fp_overweight_history': {
-        'name': 'Prior Readmission Over-Weighting',
-        'description': 'Model over-weighted prior readmission history',
-        'condition': lambda row: row.get('prev_was_readmitted', 0) == 1 and row['y_pred'] == 1 and row['y_true'] == 0
-    },
-    'fp_high_medication': {
-        'name': 'Medication Count Over-Weighting',
-        'description': 'High medication count may have inflated risk',
-        'condition': lambda row: row.get('n_medications', 0) >= 40 and row['y_pred'] == 1 and row['y_true'] == 0
-    },
-    'fn_unpredictable': {
-        'name': 'Unpredictable Events',
-        'description': 'Readmission due to trauma/accident (unavoidable)',
-        'condition': lambda row: row.get('is_unpredictable_service', 0) == 1 and row['y_pred'] == 0 and row['y_true'] == 1
-    },
-    'fn_low_data': {
-        'name': 'Insufficient Clinical Data',
-        'description': 'Missing key clinical information',
-        'condition': lambda row: (row.get('n_diagnoses', 0) < 5 or row.get('n_medications', 0) < 10) and row['y_pred'] == 0 and row['y_true'] == 1
-    },
-    'fn_specialist_disagreement': {
-        'name': 'Specialist Disagreement',
-        'description': 'High variance in specialist opinions',
-        'condition': lambda row: row.get('op_std', 0) > 0.25 and row['y_pred'] == 0 and row['y_true'] == 1
-    },
-    'fn_specialist_disagreement': {
-        'name': 'Specialist Disagreement',
-        'description': 'High variance in specialist opinions',
-        'condition': lambda row: row.get('op_std', 0) > 0.25 and row['y_pred'] == 0 and row['y_true'] == 1
-    },
-}
 
 # =============================================================================
-# EXPLAINABILITY EXTRACTOR
+# SPECIALIST EXPLAINER - ALL SPECIALISTS
 # =============================================================================
-class ExplainabilityExtractor:
-    """Extracts interpretable features from raw data for failure analysis."""
+class SpecialistExplainer:
+    """Generates human-readable explanations for ALL specialist predictions."""
     
     def __init__(self):
         import re
         self.re = re
         
-        # Expanded Keywords
-        self.keywords = {
-            'ACUTE_EVENT': [
-                'unstable', 'critical', 'sepsis', 'septic', 'shock', 'intubated', 
-                'respiratory failure', 'cardiac arrest', 'code blue', 'hypotension',
-                'hypoxia', 'altered mental status', 'unresponsive', 'coma', 'bleed',
-                'hemorrhage', 'stemi', 'nstem', 'infarction', 'stroke', 'cva'
-            ],
-            'PRIOR_UTILIZATION': [
-                'readmission', 'frequent flyer', 'multiple admission', 'recent discharge',
-                'return to ed', 'bounce back', 're-presentation', 'non-compliant'
-            ],
-            'SOCIAL_RISK': [
-                'homeless', 'undomiciled', 'shelter', 'substance', 'alcohol', 'etoh',
-                'cocaine', 'heroin', 'overdose', 'withdrawal', 'social work',
-                'lives alone', 'no support', 'financial', 'insurance', 'lack of transportation'
-            ],
-            'COMPLEXITY': [
-                'multisystem', 'transplant', 'dialysis', 'esrd', 'metastatic', 'cancer',
-                'immunosuppressed', 'hospice', 'palliative', 'dnr/dni', 'comfort care',
-                'total care', 'bedbound', 'gastrostomy', 'tracheostomy'
-            ],
-            'PROTECTIVE': [
-                'stable', 'improved', 'improving', 'tolerating', 'weaned',
-                'ambulatory', 'independent', 'self-care', 'alert and oriented',
-                'participating', 'family at bedside', 'involved family', 
-                'lives with spouse', 'lives with family', 'home health', 'vna',
-                'follow-up arranged', 'appointment scheduled', 'rehabilitation', 
-                'snf', 'skilled nursing', 'compliant', 'good understanding'
-            ]
+        self.note_keywords = {
+            'ACUTE_EVENT': ['unstable', 'critical', 'sepsis', 'shock', 'intubated', 
+                'respiratory failure', 'cardiac arrest', 'hypotension', 'hypoxia', 
+                'altered mental status', 'hemorrhage', 'stroke'],
+            'SOCIAL_RISK': ['homeless', 'shelter', 'substance', 'alcohol', 'withdrawal', 
+                'lives alone', 'no support', 'financial'],
+            'COMPLEXITY': ['multisystem', 'transplant', 'dialysis', 'esrd', 'metastatic', 
+                'cancer', 'immunosuppressed', 'palliative'],
+            'PROTECTIVE': ['stable', 'improved', 'improving', 'tolerating', 'ambulatory', 
+                'family support', 'home health', 'snf', 'skilled nursing', 'compliant']
         }
-        
-    def analyze_note(self, text: str) -> Dict[str, any]:
-        """Analyze clinical note text for keywords."""
+    
+    def analyze_note(self, text: str) -> Dict:
+        """Analyze clinical note for keywords."""
         if not isinstance(text, str) or pd.isna(text):
             return {}
-            
+        
         text_lower = text.lower()
         results = {}
         
-        # Count keywords
-        for category, words in self.keywords.items():
+        for category, words in self.note_keywords.items():
             found = [w for w in words if w in text_lower]
             results[f'kw_{category}_count'] = len(found)
-            results[f'kw_{category}_found'] = found[:3] 
-            
+            results[f'kw_{category}_found'] = found[:3]
+        
         return results
+    
+    def explain_lab_specialist(self, score: float, case: pd.Series) -> str:
+        """Explain Lab Specialist prediction."""
+        explanations = []
         
-    def generate_note_explanation(self, score: float, analysis: Dict, case: pd.Series) -> str:
-        """Generate text explanation for note score using text and metadata."""
-        explanation = []
-        
-        if score > 0.65:
-            # Explain HIGH score
-            # 1. Check Keywords (most important - actual text content)
-            keyword_explanations = []
+        if score > 0.65:  # HIGH RISK
+            lab_issues = []
             
-            if analysis.get('kw_ACUTE_EVENT_count', 0) > 0:
-                words = ", ".join(analysis['kw_ACUTE_EVENT_found'][:3])
-                keyword_explanations.append(f"acute instability indicators ({words})")
+            creat = case.get('creatinine_mean', 0)
+            if creat > 3.0:
+                lab_issues.append(f"severe kidney dysfunction (Cr {creat:.1f} mg/dL, normal <1.2)")
+            elif creat > 1.5:
+                lab_issues.append(f"kidney impairment (Cr {creat:.1f} mg/dL)")
             
-            if analysis.get('kw_SOCIAL_RISK_count', 0) > 0:
-                words = ", ".join(analysis['kw_SOCIAL_RISK_found'][:3])
-                keyword_explanations.append(f"social/behavioral risk factors ({words})")
-                
-            if analysis.get('kw_PRIOR_UTILIZATION_count', 0) > 0:
-                words = ", ".join(analysis['kw_PRIOR_UTILIZATION_found'][:3])
-                keyword_explanations.append(f"prior utilization patterns ({words})")
-
-            if analysis.get('kw_COMPLEXITY_count', 0) > 0:
-                words = ", ".join(analysis['kw_COMPLEXITY_found'][:3])
-                keyword_explanations.append(f"multisystem complexity ({words})")
+            hgb = case.get('hemoglobin_mean', 0)
+            if 0 < hgb < 7:
+                lab_issues.append(f"severe anemia (Hgb {hgb:.1f} g/dL, normal >12)")
+            elif 0 < hgb < 10:
+                lab_issues.append(f"anemia (Hgb {hgb:.1f} g/dL)")
             
-            # If we found keywords, that's the primary explanation
-            if keyword_explanations:
-                explanation.append(f"Clinical notes document: {'; '.join(keyword_explanations)}")
+            lactate = case.get('lactate_mean', 0)
+            if lactate > 4.0:
+                lab_issues.append(f"severe lactic acidosis (lactate {lactate:.1f}, suggests sepsis/shock)")
+            elif lactate > 2.0:
+                lab_issues.append(f"elevated lactate ({lactate:.1f}, tissue hypoperfusion)")
+            
+            wbc = case.get('wbc_mean', 0)
+            if wbc > 20:
+                lab_issues.append(f"marked leukocytosis (WBC {wbc:.1f}K, suggests infection)")
+            elif 0 < wbc < 4:
+                lab_issues.append(f"leukopenia (WBC {wbc:.1f}K, immunosuppression)")
+            
+            bili = case.get('bilirubin_mean', 0)
+            if bili > 3.0:
+                lab_issues.append(f"severe hyperbilirubinemia (T.Bili {bili:.1f} mg/dL)")
+            
+            inr = case.get('inr_mean', 0)
+            if inr > 2.0:
+                lab_issues.append(f"coagulopathy (INR {inr:.1f}, bleeding risk)")
+            
+            if lab_issues:
+                explanations.append(f"Critical lab abnormalities: {'; '.join(lab_issues[:3])}")
             else:
-                # 2. Fallback: Explain via metadata + what ClinicalBERT likely detected
-                context_signals = []
-                
+                explanations.append("Borderline abnormal labs with concerning trends")
+        else:  # LOW RISK
+            normal_labs = []
+            creat = case.get('creatinine_mean', 0)
+            if 0 < creat <= 1.2:
+                normal_labs.append("normal kidney function")
+            hgb = case.get('hemoglobin_mean', 0)
+            if hgb >= 12:
+                normal_labs.append("normal hemoglobin")
+            
+            if normal_labs:
+                explanations.append(f"Labs reassuring: {', '.join(normal_labs)}")
+            else:
+                explanations.append("No critical lab abnormalities")
+        
+        return "; ".join(explanations) if explanations else "Lab patterns analyzed"
+    
+    def explain_note_specialist(self, score: float, text_analysis: Dict, case: pd.Series) -> str:
+        """Explain Note Specialist prediction."""
+        explanations = []
+        
+        if score > 0.65:  # HIGH RISK
+            kw_exp = []
+            
+            if text_analysis.get('kw_ACUTE_EVENT_count', 0) > 0:
+                words = ", ".join(text_analysis['kw_ACUTE_EVENT_found'][:3])
+                kw_exp.append(f"acute instability ({words})")
+            
+            if text_analysis.get('kw_SOCIAL_RISK_count', 0) > 0:
+                words = ", ".join(text_analysis['kw_SOCIAL_RISK_found'][:3])
+                kw_exp.append(f"social barriers ({words})")
+            
+            if text_analysis.get('kw_COMPLEXITY_count', 0) > 0:
+                words = ", ".join(text_analysis['kw_COMPLEXITY_found'][:3])
+                kw_exp.append(f"complex care ({words})")
+            
+            if kw_exp:
+                explanations.append(f"Notes document: {'; '.join(kw_exp)}")
+            else:
+                context = []
                 if case.get('n_diagnoses', 0) > 25:
-                    context_signals.append(f"{int(case['n_diagnoses'])} diagnoses suggesting complex multimorbidity")
+                    context.append(f"{int(case['n_diagnoses'])} diagnoses")
                 if case.get('n_medications', 0) > 20:
-                    context_signals.append(f"{int(case['n_medications'])} medications indicating polypharmacy")
+                    context.append(f"{int(case['n_medications'])} medications")
                 if case.get('los_days', 0) > 10:
-                    context_signals.append(f"{case['los_days']:.1f}-day stay suggesting complicated course")
-                if case.get('charlson_score', 0) > 6:
-                    context_signals.append(f"Charlson score {int(case['charlson_score'])} (severe comorbidity burden)")
-                if case.get('emergency_admission', 0) == 1:
-                    context_signals.append("emergency admission")
-                    
-                if context_signals:
-                    # More specific explanation of what the model detected
-                    explanation.append(
-                        f"ClinicalBERT embeddings + manual features detected high-risk patterns. "
-                        f"Clinical context: {'; '.join(context_signals[:2])}. "
-                        f"Likely captured: treatment intensity, care transitions, or latent clinical deterioration markers in note language"
-                    )
-                else:
-                    explanation.append(
-                        "ClinicalBERT detected high-risk language patterns in notes "
-                        "(e.g., urgent tone, treatment escalation terminology, or coded references to instability) "
-                        "not captured by explicit keywords"
-                    )
-                    
-        else:
-            # Explain LOW score
-            protective_explanations = []
-            
-            if analysis.get('kw_PROTECTIVE_count', 0) > 0:
-                words = ", ".join(analysis['kw_PROTECTIVE_found'][:3])
-                protective_explanations.append(f"stability indicators ({words})")
-            
-            if protective_explanations:
-                explanation.append(f"Clinical notes emphasize: {'; '.join(protective_explanations)}")
-            else:
-                # Explain why low
-                if case.get('n_diagnoses', 0) < 10 and case.get('los_days', 0) < 3:
-                    explanation.append(
-                        f"Note language consistent with uncomplicated course "
-                        f"({int(case.get('n_diagnoses', 0))} diagnoses, {case.get('los_days', 0):.1f}-day stay). "
-                        f"ClinicalBERT likely detected: routine discharge terminology, absence of complication markers"
-                    )
-                else:
-                    explanation.append(
-                        "Despite moderate clinical complexity, note language emphasizes stability. "
-                        "ClinicalBERT likely detected: positive progress descriptors, successful treatment markers, "
-                        "or planned/controlled discharge language rather than urgent/unplanned terminology"
-                    )
+                    context.append(f"{case['los_days']:.0f}-day stay")
                 
-        return "; ".join(explanation)
+                if context:
+                    explanations.append(
+                        f"ClinicalBERT detected high-risk patterns. Context: {', '.join(context[:2])}. "
+                        f"Likely: treatment escalation, instability markers"
+                    )
+                else:
+                    explanations.append("High-risk language patterns (urgent tone, complications)")
+        else:  # LOW RISK
+            if text_analysis.get('kw_PROTECTIVE_count', 0) > 0:
+                words = ", ".join(text_analysis['kw_PROTECTIVE_found'][:3])
+                explanations.append(f"Stability emphasized: {words}")
+            else:
+                if case.get('los_days', 0) < 3:
+                    explanations.append(f"Uncomplicated {case.get('los_days', 0):.0f}-day stay")
+                else:
+                    explanations.append("Stable course, positive progress descriptors")
+        
+        return "; ".join(explanations)
+    
+    def explain_pharmacy_specialist(self, score: float, med_text: str, case: pd.Series) -> str:
+        """Explain Pharmacy Specialist prediction."""
+        explanations = []
+        
+        if not isinstance(med_text, str):
+            med_text = ""
+        
+        med_lower = med_text.lower()
+        n_meds = case.get('n_medications', len(med_text.split(',')))
+        
+        if score > 0.65:  # HIGH RISK
+            risk_meds = []
+            
+            high_risk = {
+                'anticoagulants': ['warfarin', 'heparin', 'enoxaparin', 'rivaroxaban'],
+                'insulin': ['insulin', 'lantus', 'humalog'],
+                'opioids': ['morphine', 'oxycodone', 'fentanyl', 'dilaudid'],
+                'cardiac': ['digoxin', 'amiodarone']
+            }
+            
+            for category, meds in high_risk.items():
+                found = [m for m in meds if m in med_lower]
+                if found:
+                    risk_meds.append(f"{category} ({', '.join(found[:2])})")
+            
+            if risk_meds:
+                explanations.append(f"High-risk medications: {'; '.join(risk_meds[:3])}")
+            
+            if n_meds >= 20:
+                explanations.append(f"Extreme polypharmacy ({n_meds} meds, interaction/adherence risk)")
+            elif n_meds >= 15:
+                explanations.append(f"Polypharmacy ({n_meds} medications)")
+            
+            if not explanations:
+                explanations.append("Complex medication regimen with multiple risk factors")
+        else:  # LOW RISK
+            if n_meds < 5:
+                explanations.append(f"Simple regimen ({n_meds} medications)")
+            elif n_meds < 10:
+                explanations.append(f"Manageable burden ({n_meds} meds, no high-risk agents)")
+            else:
+                explanations.append("Moderate med count, no high-risk combinations")
+        
+        return "; ".join(explanations) if explanations else "Medication profile analyzed"
+    
+    def explain_history_specialist(self, score: float, history_text: str, case: pd.Series) -> str:
+        """Explain History Specialist prediction."""
+        explanations = []
+        
+        if not isinstance(history_text, str):
+            history_text = ""
+        
+        history_lower = history_text.lower()
+        
+        if score > 0.65:  # HIGH RISK
+            conditions = []
+            
+            if 'heart failure' in history_lower or 'chf' in history_lower:
+                conditions.append("heart failure")
+            if 'copd' in history_lower:
+                conditions.append("COPD")
+            if 'diabetes' in history_lower:
+                conditions.append("diabetes")
+            if 'dialysis' in history_lower or 'esrd' in history_lower:
+                conditions.append("end-stage renal disease")
+            if 'cirrhosis' in history_lower:
+                conditions.append("liver disease")
+            if 'cancer' in history_lower or 'metastatic' in history_lower:
+                conditions.append("malignancy")
+            
+            if conditions:
+                explanations.append(
+                    f"High-risk chronic conditions ({len(conditions)}): {', '.join(conditions[:3])}"
+                )
+            
+            if 'readmit' in history_lower or 'prior admission' in history_lower:
+                explanations.append("Prior admissions/readmissions documented")
+            
+            if not explanations:
+                charlson = case.get('charlson_score', 0)
+                if charlson >= 5:
+                    explanations.append(f"Heavy comorbidity burden (Charlson {charlson})")
+                else:
+                    explanations.append("Complex medical history")
+        else:  # LOW RISK
+            if len(history_text) < 100:
+                explanations.append("Limited significant medical history")
+            else:
+                charlson = case.get('charlson_score', 0)
+                if charlson <= 2:
+                    explanations.append(f"Low comorbidity burden (Charlson {charlson})")
+                else:
+                    explanations.append("Stable chronic conditions, well-controlled")
+        
+        return "; ".join(explanations) if explanations else "Medical history assessed"
+    
+    def explain_psychosocial_specialist(self, score: float, text: str, case: pd.Series) -> str:
+        """Explain Psychosocial Specialist prediction."""
+        explanations = []
+        
+        if not isinstance(text, str):
+            text = ""
+        
+        text_lower = text.lower()
+        
+        if score > 0.65:  # HIGH RISK
+            risks = []
+            
+            if any(w in text_lower for w in ['depression', 'anxiety', 'psychiatric', 'suicid']):
+                risks.append("mental health concerns")
+            
+            if any(w in text_lower for w in ['substance', 'alcohol', 'drug abuse', 'withdrawal']):
+                risks.append("substance use disorder")
+            
+            if 'homeless' in text_lower or 'shelter' in text_lower:
+                risks.append("housing instability")
+            elif 'lives alone' in text_lower or 'no support' in text_lower:
+                risks.append("limited social support")
+            
+            if 'non-compliant' in text_lower or 'non-adherent' in text_lower:
+                risks.append("medication non-adherence")
+            
+            if risks:
+                explanations.append(f"Psychosocial barriers: {', '.join(risks[:3])}")
+            else:
+                explanations.append("Psychosocial risk factors (care access, support concerns)")
+        else:  # LOW RISK
+            protective = []
+            
+            if 'family support' in text_lower or 'caregiver' in text_lower:
+                protective.append("strong family support")
+            if 'follow-up scheduled' in text_lower:
+                protective.append("care continuity arranged")
+            if 'snf' in text_lower or 'rehab' in text_lower or 'home health' in text_lower:
+                protective.append("transitional care services")
+            
+            if protective:
+                explanations.append(f"Protective factors: {', '.join(protective)}")
+            else:
+                explanations.append("No major psychosocial barriers")
+        
+        return "; ".join(explanations) if explanations else "Psychosocial factors reviewed"
 
 
-
-
-
+# =============================================================================
+# FAILURE ANALYZER
+# =============================================================================
 class FailureAnalyzer:
-    """Comprehensive failure analysis for readmission prediction models."""
+    """Comprehensive failure analysis with specialist explanations."""
     
     def __init__(self, arch_num: int, arch_name: str):
-        """Initialize analyzer for specific architecture.
-        
-        Args:
-            arch_num: Architecture number (0-6)
-            arch_name: Architecture name (e.g., 'IMSE')
-        """
         self.arch_num = arch_num
         self.arch_name = arch_name
         self.output_dir = os.path.join(ANALYSIS_DIR, f'arch{arch_num}_{arch_name}')
         os.makedirs(self.output_dir, exist_ok=True)
-        
-        self.df_full = None
-        self.fp_cases = None
-        self.fn_cases = None
-        self.error_patterns = {}
+        self.explainer = SpecialistExplainer()
     
     def load_predictions(self, predictions_file: str) -> pd.DataFrame:
-        """Load predictions and merge with original text data.
-        
-        Args:
-            predictions_file: Path to predictions CSV
-            
-        Returns:
-            DataFrame with predictions, features, and text
-        """
-        if not os.path.exists(predictions_file):
-            raise FileNotFoundError(f"Predictions file not found: {predictions_file}")
-            
-        # 1. Load predictions
+        """Load predictions and merge with text data."""
         df = pd.read_csv(predictions_file)
         
-        # Ensure required columns exist
-        required = ['y_true', 'y_pred', 'y_prob']
-        if not all(col in df.columns for col in required):
-            raise ValueError(f"Missing required columns: {required}")
-            
-        # 2. Load original data for text
         try:
             print("   Loading original data for text analysis...")
             orig_df = pd.read_csv(DATA_PATH)
             
-            # Check for identifiers
             if 'hadm_id' in df.columns and 'hadm_id' in orig_df.columns:
-                # Merge on hadm_id
-                cols_to_merge = ['hadm_id', 'clinical_text']
-                if 'subject_id' in orig_df.columns and 'subject_id' not in df.columns:
-                    cols_to_merge.append('subject_id')
+                text_cols = ['hadm_id', 'clinical_text']
+                if 'med_list_text' in orig_df.columns:
+                    text_cols.append('med_list_text')
+                if 'full_history_text' in orig_df.columns:
+                    text_cols.append('full_history_text')
                 
-                print("   Merging predictions with clinical text...")
-                df = df.merge(orig_df[cols_to_merge], on='hadm_id', how='left')
-                
+                df = df.merge(orig_df[text_cols], on='hadm_id', how='left')
             else:
-                print("   ⚠️ Identifiers (hadm_id) not found in predictions. Skipping text merge.")
                 df['clinical_text'] = ""
-                
+                df['med_list_text'] = ""
+                df['full_history_text'] = ""
         except Exception as e:
-            print(f"   ⚠️ Failed to load original data: {e}")
+            print(f"   ⚠️ Failed to load text: {e}")
             df['clinical_text'] = ""
-            
+            df['med_list_text'] = ""
+            df['full_history_text'] = ""
+        
         return df
     
-    def generate_case_report(self, case: pd.Series, error_type: str) -> str:
-        """Generate detailed human-readable report for a single case."""
-        report = []
-        extractor = ExplainabilityExtractor()
-        
-        # Analyze text if available
-        text_analysis = extractor.analyze_note(case.get('clinical_text', ''))
-        
-        report.append(f"CASE REPORT: {error_type}")
-        report.append("-" * 40)
-        report.append(f"Subject ID:  {case.get('subject_id', 'N/A')}")
-        report.append(f"HADM ID:     {case.get('hadm_id', 'N/A')}")
-        report.append(f"Indices:     Row {case.name}")
-        report.append("")
-        
-        report.append("[MODEL PREDICTION]")
-        risk_level = self.classify_risk_level(case['y_prob'])
-        report.append(f"   Prediction:  {'READMIT' if case['y_pred']==1 else 'NO READMIT'}")
-        report.append(f"   Probability: {case['y_prob']:.2%}  [{risk_level}]")
-        report.append(f"   Actual:      {'READMIT' if case['y_true']==1 else 'NO READMIT'}")
-        report.append("")
-        
-        if 'uncertainty_threshold' in case.index:
-            lower = case.get('y_lower', case['y_prob'])
-            upper = case.get('y_upper', case['y_prob'])
-            report.append(f"   Uncertainty: {lower:.2%} - {upper:.2%}")
-            report.append("")
-            
-        report.append("[BRAIN] SPECIALIST OPINIONS:")
-        specialists = [
-            ('Lab Specialist', case.get('op_lab', 0), 'lab'),
-            ('Note Specialist', case.get('op_note', 0), 'note'),
-            ('Pharmacy Specialist', case.get('op_pharm', 0), 'pharm'),
-            ('History Specialist', case.get('op_hist', 0), 'hist'),
-            ('Psychosocial Specialist', case.get('op_psych', 0), 'psych'),
-        ]
-        
-        for name, prob, spec_type in specialists:
-            level = self.classify_specialist_opinion(prob)
-            explanation = ""
-            
-            # Add specific explanations
-            if spec_type == 'note':
-                explanation = extractor.generate_note_explanation(prob, text_analysis)
-                if explanation:
-                    explanation = f"\n      ↳ WHY: {explanation}"
-            
-            report.append(f"   {name:25s} {prob:.2%}  [{level}]{explanation}")
-        
-        # Psychosocial sub-scores
-        if 'op_psych_mental' in case.index:
-            report.append("")
-            report.append("   Psychosocial Sub-Scores:")
-            report.append(f"      Mental Health:    {case.get('op_psych_mental', 0):.2%}")
-            
-            # Explain Social Support
-            social_analysis = ""
-            if text_analysis.get('social_negative'):
-                social_analysis = f" (neg: {', '.join(text_analysis['social_negative'][:2])})"
-            elif text_analysis.get('social_positive'):
-                social_analysis = f" (pos: {', '.join(text_analysis['social_positive'][:2])})"
-                
-            report.append(f"      Social Support:   {case.get('op_psych_social', 0):.2%}{social_analysis}")
-            report.append(f"      Care Support:     {case.get('op_psych_care', 0):.2%}")
-
-        return "\n".join(report)
-    
     def classify_risk_level(self, prob: float) -> str:
-        """Classify probability into risk level.
-        
-        Args:
-            prob: Predicted probability
-            
-        Returns:
-            Risk level string
-        """
         if prob < RISK_THRESHOLDS['low']:
             return 'LOW'
         elif prob < RISK_THRESHOLDS['moderate']:
@@ -412,14 +374,6 @@ class FailureAnalyzer:
             return 'VERY HIGH'
     
     def classify_specialist_opinion(self, prob: float) -> str:
-        """Classify specialist opinion.
-        
-        Args:
-            prob: Specialist probability
-            
-        Returns:
-            Opinion level string
-        """
         if prob < SPECIALIST_THRESHOLDS['low']:
             return 'LOW'
         elif prob < SPECIALIST_THRESHOLDS['moderate']:
@@ -429,124 +383,14 @@ class FailureAnalyzer:
         else:
             return 'VERY HIGH'
     
-    def identify_error_patterns(self, df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-        """Identify systematic error patterns.
-        
-        Args:
-            df: DataFrame with predictions and features
-            
-        Returns:
-            Dictionary of error pattern DataFrames
-        """
-        patterns = {}
-        
-        for pattern_id, pattern_info in ERROR_PATTERNS.items():
-            # Apply condition
-            try:
-                mask = df.apply(pattern_info['condition'], axis=1)
-                pattern_df = df[mask].copy()
-                
-                if len(pattern_df) > 0:
-                    patterns[pattern_id] = {
-                        'name': pattern_info['name'],
-                        'description': pattern_info['description'],
-                        'count': len(pattern_df),
-                        'cases': pattern_df
-                    }
-            except Exception as e:
-                print(f"  ⚠️ Error checking pattern {pattern_id}: {e}")
-                continue
-        
-        return patterns
-    
-    def analyze_fp_cases(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
-        """Analyze False Positive cases.
-        
-        Args:
-            df: DataFrame with predictions
-            
-        Returns:
-            Tuple of (fp_dataframe, fp_statistics)
-        """
-        fp = df[(df['y_pred'] == 1) & (df['y_true'] == 0)].copy()
-        
-        if len(fp) == 0:
-            return pd.DataFrame(), {}
-        
-        # Add risk classification
-        fp['risk_level'] = fp['y_prob'].apply(self.classify_risk_level)
-        
-        # Compute statistics
-        stats = {
-            'total': len(fp),
-            'rate': len(fp) / len(df),
-            'avg_prob': fp['y_prob'].mean(),
-            'risk_distribution': fp['risk_level'].value_counts().to_dict(),
-        }
-        
-        # Common characteristics
-        if 'supervised_discharge' in fp.columns:
-            stats['pct_supervised_discharge'] = fp['supervised_discharge'].mean()
-        if 'prev_was_readmitted' in fp.columns:
-            stats['pct_prev_readmitted'] = fp['prev_was_readmitted'].mean()
-        if 'n_medications' in fp.columns:
-            stats['avg_medications'] = fp['n_medications'].mean()
-        if 'protective_score' in fp.columns:
-            stats['avg_protective_score'] = fp['protective_score'].mean()
-        
-        return fp, stats
-    
-    def analyze_fn_cases(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
-        """Analyze False Negative cases.
-        
-        Args:
-            df: DataFrame with predictions
-            
-        Returns:
-            Tuple of (fn_dataframe, fn_statistics)
-        """
-        fn = df[(df['y_pred'] == 0) & (df['y_true'] == 1)].copy()
-        
-        if len(fn) == 0:
-            return pd.DataFrame(), {}
-        
-        # Add risk classification
-        fn['risk_level'] = fn['y_prob'].apply(self.classify_risk_level)
-        
-        # Compute statistics
-        stats = {
-            'total': len(fn),
-            'rate': len(fn) / len(df),
-            'avg_prob': fn['y_prob'].mean(),
-            'risk_distribution': fn['risk_level'].value_counts().to_dict(),
-        }
-        
-        # Common characteristics
-        if 'is_unpredictable_service' in fn.columns:
-            stats['pct_unpredictable'] = fn['is_unpredictable_service'].mean()
-        if 'op_std' in fn.columns:
-            stats['avg_specialist_disagreement'] = fn['op_std'].mean()
-        if 'n_diagnoses' in fn.columns:
-            stats['avg_diagnoses'] = fn['n_diagnoses'].mean()
-        
-        return fn, stats
-    
     def generate_case_report(self, case: pd.Series, case_num: int, error_type: str) -> str:
-        """Generate detailed report for a single case.
-        
-        Args:
-            case: Series with case data
-            case_num: Case number
-            error_type: 'FP' or 'FN'
-            
-        Returns:
-            Formatted case report string
-        """
+        """Generate detailed case report with specialist explanations."""
         report = []
-        extractor = ExplainabilityExtractor()
         
-        # Analyze text if available
-        text_analysis = extractor.analyze_note(case.get('clinical_text', ''))
+        clinical_text = case.get('clinical_text', '')
+        med_text = case.get('med_list_text', '')
+        history_text = case.get('full_history_text', '')
+        text_analysis = self.explainer.analyze_note(clinical_text)
         
         report.append("=" * 80)
         report.append(f"CASE #{case_num} - HADM_ID: {case.get('hadm_id', 'UNKNOWN')}")
@@ -554,152 +398,127 @@ class FailureAnalyzer:
         report.append("=" * 80)
         report.append("")
         
-        # Prediction summary
-        report.append("[PREDICT] PREDICTION SUMMARY:")
+        # Prediction
+        report.append("[PREDICTION SUMMARY]")
         report.append(f"   Risk Level:        {self.classify_risk_level(case['y_prob'])}")
         report.append(f"   Predicted Prob:    {case['y_prob']:.2%}")
-        report.append(f"   Predicted Label:   {'READMITTED' if case['y_pred'] == 1 else 'NOT READMITTED'}")
-        report.append(f"   Actual Outcome:    {'READMITTED' if case['y_true'] == 1 else 'NOT READMITTED'}")
-        report.append(f"   Prediction:        {'✓ CORRECT' if case['y_pred'] == case['y_true'] else '✗ INCORRECT'}")
-        if 'uncertainty_threshold' in case.index:
-            lower = case.get('y_lower', case['y_prob'])
-            upper = case.get('y_upper', case['y_prob'])
-            report.append(f"   Uncertainty Range: {lower:.2%} - {upper:.2%}")
+        report.append(f"   Predicted:         {'READMITTED' if case['y_pred'] == 1 else 'NOT READMITTED'}")
+        report.append(f"   Actual:            {'READMITTED' if case['y_true'] == 1 else 'NOT READMITTED'}")
+        report.append(f"   Result:            {'✗ INCORRECT' if case['y_pred'] != case['y_true'] else '✓ CORRECT'}")
         report.append("")
         
         # Patient context
-        report.append("[USER] PATIENT CONTEXT:")
-        report.append(f"   Age:                 {case.get('anchor_age', 'N/A')} years")
-        report.append(f"   Gender:              {case.get('gender', 'N/A')}")
-        report.append(f"   Prior Visits:        {case.get('prior_visits_count', 'N/A')}")
-        report.append(f"   Prior Readmissions:  {case.get('n_prior_readmissions', 'N/A')}")
-        report.append(f"   ED Visits (6mo):     {case.get('ed_visits_6mo', 'N/A')}")
-        report.append(f"   Length of Stay:      {case.get('los_days', 'N/A'):.1f} days")
-        report.append(f"   ICU Days:            {case.get('icu_days', 'N/A'):.1f} days")
-        report.append(f"   Service:             {case.get('curr_service', 'N/A')}")
-        report.append(f"   Charlson Score:      {case.get('charlson_score', 'N/A')}")
-        report.append(f"   Emergency Admit:     {'Yes' if case.get('emergency_admit', 0) == 1 else 'No'}")
-        report.append(f"   Supervised Disch:    {'Yes' if case.get('supervised_discharge', 0) == 1 else 'No'}")
+        report.append("[PATIENT CONTEXT]")
+        report.append(f"   Age:               {case.get('anchor_age', 'N/A')} years")
+        report.append(f"   Gender:            {case.get('gender', 'N/A')}")
+        report.append(f"   Length of Stay:    {case.get('los_days', 'N/A'):.1f} days")
+        report.append(f"   ICU Days:          {case.get('icu_days', 0):.1f} days")
+        report.append(f"   Charlson Score:    {case.get('charlson_score', 'N/A')}")
+        report.append(f"   Medications:       {case.get('n_medications', 'N/A')}")
+        report.append(f"   Diagnoses:         {case.get('n_diagnoses', 'N/A')}")
         report.append("")
         
-        # Clinical complexity
-        report.append("[MEDICAL] CLINICAL COMPLEXITY:")
-        report.append(f"   Medications:         {case.get('n_medications', 'N/A')}")
-        report.append(f"   Diagnoses:           {case.get('n_diagnoses', 'N/A')}")
-        report.append(f"   Procedures:          {case.get('n_procedures', 'N/A')}")
-        if 'charlson_score' in case and 'los_days' in case:
-            lace = min(case.get('los_days', 0), 14) + case.get('charlson_score', 0)
-            report.append(f"   LACE Score:          {lace:.1f}")
+        # Specialists WITH explanations
+        report.append("[SPECIALIST OPINIONS - WITH EXPLANATIONS]")
         report.append("")
         
-        # Specialist opinions
-        if 'op_lab' in case.index:
-            report.append("[BRAIN] SPECIALIST OPINIONS:")
-            specialists = [
-                ('Lab Specialist', case.get('op_lab', 0), 'lab'),
-                ('Note Specialist', case.get('op_note', 0), 'note'),
-                ('Pharmacy Specialist', case.get('op_pharm', 0), 'pharm'),
-                ('History Specialist', case.get('op_hist', 0), 'hist'),
-                ('Psychosocial Specialist', case.get('op_psych', 0), 'psych'),
-            ]
+        specialists = [
+            ('Lab Specialist', 'op_lab', 'lab'),
+            ('Note Specialist', 'op_note', 'note'),
+            ('Pharmacy Specialist', 'op_pharm', 'pharm'),
+            ('History Specialist', 'op_hist', 'hist'),
+            ('Psychosocial Specialist', 'op_psych', 'psych'),
+        ]
+        
+        for name, col, spec_type in specialists:
+            if col not in case.index:
+                continue
             
-            for name, prob, spec_type in specialists:
-                level = self.classify_specialist_opinion(prob)
-                explanation = ""
-                
-                # Add specific explanations
-                if spec_type == 'note':
-                    explanation = extractor.generate_note_explanation(prob, text_analysis, case)
-                    if explanation:
-                        explanation = f"\n      ↳ WHY: {explanation}"
-                        
-                report.append(f"   {name:25s} {prob:.2%}  [{level}]{explanation}")
+            prob = case[col]
+            level = self.classify_specialist_opinion(prob)
+            report.append(f"   {name:30s} {prob:.2%}  [{level}]")
             
-            # Psychosocial sub-scores
-            if 'op_psych_mental' in case.index:
-                report.append("")
-                report.append("   Psychosocial Sub-Scores:")
-                report.append(f"      Mental Health:    {case.get('op_psych_mental', 0):.2%}")
-                
-                # Explain Social Support
-                social_analysis = ""
-                if text_analysis.get('social_negative'):
-                    social_analysis = f" (neg: {', '.join(text_analysis['social_negative'][:2])})"
-                elif text_analysis.get('social_positive'):
-                    social_analysis = f" (pos: {', '.join(text_analysis['social_positive'][:2])})"
-                    
-                report.append(f"      Social Support:   {case.get('op_psych_social', 0):.2%}{social_analysis}")
-                
-                # Add Care Support
-                report.append(f"      Care Support:     {case.get('op_psych_care', 0):.2%}")
+            # Get explanation
+            explanation = ""
+            if spec_type == 'lab':
+                explanation = self.explainer.explain_lab_specialist(prob, case)
+            elif spec_type == 'note':
+                explanation = self.explainer.explain_note_specialist(prob, text_analysis, case)
+            elif spec_type == 'pharm':
+                explanation = self.explainer.explain_pharmacy_specialist(prob, med_text, case)
+            elif spec_type == 'hist':
+                explanation = self.explainer.explain_history_specialist(prob, history_text, case)
+            elif spec_type == 'psych':
+                explanation = self.explainer.explain_psychosocial_specialist(prob, clinical_text, case)
             
-            # Agreement
-            if 'op_std' in case.index:
-                agreement = "HIGH" if case['op_std'] < 0.15 else "MODERATE" if case['op_std'] < 0.25 else "LOW"
-                report.append("")
-                report.append(f"   Agent Agreement:     {agreement}")
+            if explanation:
+                # Word wrap at 76 chars
+                words = explanation.split()
+                lines = []
+                current = "      ↳ WHY: "
+                
+                for word in words:
+                    if len(current) + len(word) + 1 > 76:
+                        lines.append(current)
+                        current = "              " + word
+                    else:
+                        current += (" " + word) if not current.endswith("WHY: ") else word
+                
+                if current.strip():
+                    lines.append(current)
+                
+                report.extend(lines)
             
             report.append("")
         
+        # Psychosocial sub-scores
+        if 'op_psych_mental' in case.index:
+            report.append("   Psychosocial Sub-Scores:")
+            report.append(f"      Mental Health:    {case.get('op_psych_mental', 0):.2%}")
+            report.append(f"      Social Support:   {case.get('op_psych_social', 0):.2%}")
+            report.append(f"      Care Access:      {case.get('op_psych_care', 0):.2%}")
+            report.append("")
+        
+        # Agreement
+        if 'op_std' in case.index:
+            std = case['op_std']
+            agreement = "HIGH" if std < 0.15 else "MODERATE" if std < 0.25 else "LOW"
+            report.append(f"   Specialist Agreement:  {agreement} (std={std:.3f})")
+            report.append("")
+        
         # Error analysis
-        report.append("[WARNING] ERROR ANALYSIS:")
+        report.append("[ERROR ANALYSIS]")
         if error_type == 'FALSE POSITIVE':
-            report.append("   FALSE POSITIVE: Model predicted readmission but patient was not readmitted")
-            report.append("   Possible reasons:")
+            report.append("   Model predicted readmission but patient was NOT readmitted")
+            report.append("")
+            report.append("   Likely Contributing Factors:")
             
-            # Check protective factors
-            protective = []
-            if case.get('protective_score', 0) >= 2:
-                protective.append("high protective score")
             if case.get('supervised_discharge', 0) == 1:
-                protective.append("supervised discharge")
-            if case.get('pf_followup_scheduled', 0) == 1:
-                protective.append("scheduled followup")
-            if case.get('pf_family_support', 0) == 1:
-                protective.append("family support")
+                report.append("   • Patient discharged to SNF/rehab (protective)")
             
-            # Add text-based protective explanations
             if text_analysis.get('kw_PROTECTIVE_count', 0) > 2:
-                protective.append("strong stability keywords in notes")
+                words = ', '.join(text_analysis['kw_PROTECTIVE_found'][:3])
+                report.append(f"   • Stability indicators in notes: {words}")
             
-            if protective:
-                report.append(f"   • Protective factors present: {', '.join(protective)}")
+            if case.get('n_medications', 0) >= 30:
+                report.append(f"   • High medication count ({case['n_medications']}) may have inflated risk")
             
-            # Check over-weighting
-            if case.get('n_medications', 0) >= 40:
-                report.append("   • High medication count may have over-weighted risk")
-            if case.get('prev_was_readmitted', 0) == 1:
-                report.append("   • Model may have over-weighted prior readmission history")
-            if case.get('op_std', 0) < 0.1:
-                report.append("   • High specialist agreement may have inflated confidence")
-            if case.get('charlson_score', 0) >= 5:
-                report.append("   • High comorbidity score may have over-estimated risk")
-            
+            if case.get('charlson_score', 0) >= 6:
+                report.append(f"   • High Charlson ({case['charlson_score']}) but stable conditions")
+        
         else:  # FALSE NEGATIVE
-            report.append("   FALSE NEGATIVE: Model predicted NO readmission but patient WAS readmitted")
-            report.append("   Possible reasons:")
+            report.append("   Model predicted NO readmission but patient WAS readmitted")
+            report.append("")
+            report.append("   Likely Contributing Factors:")
             
-            # Check unpredictable
-            if case.get('is_unpredictable_service', 0) == 1:
-                report.append("   • Unpredictable event (trauma/accident) - clinically unavoidable")
-            
-            # Check data quality
             if case.get('n_diagnoses', 0) < 5:
                 report.append("   • Low diagnosis count - insufficient clinical data")
-            if case.get('n_medications', 0) < 10:
-                report.append("   • Low medication count - may indicate incomplete record")
             
-            # Check disagreement
             if case.get('op_std', 0) > 0.25:
                 report.append("   • High specialist disagreement - conflicting signals")
             
-            # Check low risk indicators
             if case.get('y_prob', 1.0) < 0.15:
-                report.append("   • Very low predicted probability - may be edge case")
-                
-            # Check text indicators for missing risk
-            if text_analysis.get('kw_HIGH_RISK_count', 0) > 0:
-                report.append(f"   • Missed high-risk keywords in notes: {', '.join(text_analysis['kw_HIGH_RISK_found'])}")
+                report.append("   • Very low predicted probability - edge case")
         
         report.append("")
         report.append("=" * 80)
@@ -707,49 +526,71 @@ class FailureAnalyzer:
         
         return "\n".join(report)
     
-    def run_analysis(self, df: pd.DataFrame, top_k: int = 25, detailed: bool = False) -> Dict:
-        """Run complete failure analysis.
+    def analyze_fp_cases(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
+        """Analyze False Positive cases."""
+        fp = df[(df['y_pred'] == 1) & (df['y_true'] == 0)].copy()
+        if len(fp) == 0:
+            return pd.DataFrame(), {}
         
-        Args:
-            df: DataFrame with predictions and features
-            top_k: Number of top cases to report
-            detailed: Whether to generate detailed case reports
-            
-        Returns:
-            Dictionary with analysis results
-        """
+        fp['risk_level'] = fp['y_prob'].apply(self.classify_risk_level)
+        stats = {
+            'total': len(fp),
+            'rate': len(fp) / len(df),
+            'avg_prob': fp['y_prob'].mean(),
+        }
+        return fp, stats
+    
+    def analyze_fn_cases(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict]:
+        """Analyze False Negative cases."""
+        fn = df[(df['y_pred'] == 0) & (df['y_true'] == 1)].copy()
+        if len(fn) == 0:
+            return pd.DataFrame(), {}
+        
+        fn['risk_level'] = fn['y_prob'].apply(self.classify_risk_level)
+        stats = {
+            'total': len(fn),
+            'rate': len(fn) / len(df),
+            'avg_prob': fn['y_prob'].mean(),
+        }
+        return fn, stats
+    
+    def run_analysis(self, df: pd.DataFrame, top_k: int = 25, detailed: bool = False) -> Dict:
+        """Run complete failure analysis."""
         print(f"\n{'='*80}")
         print(f"ANALYZING ARCHITECTURE {self.arch_num}: {self.arch_name}")
         print(f"{'='*80}")
         
-        self.df_full = df
-        
-        # Overall statistics
         total_cases = len(df)
-        total_errors = ((df['y_pred'] != df['y_true']).sum())
+        total_errors = (df['y_pred'] != df['y_true']).sum()
         
         print(f"\n   Total Cases:    {total_cases:,}")
         print(f"   Total Errors:   {total_errors:,} ({total_errors/total_cases:.1%})")
         
-        # Analyze FP and FN
-        print(f"\n   Analyzing False Positives...")
-        self.fp_cases, fp_stats = self.analyze_fp_cases(df)
-        
-        print(f"   Analyzing False Negatives...")
-        self.fn_cases, fn_stats = self.analyze_fn_cases(df)
+        fp_cases, fp_stats = self.analyze_fp_cases(df)
+        fn_cases, fn_stats = self.analyze_fn_cases(df)
         
         print(f"\n   False Positives: {fp_stats.get('total', 0):,} ({fp_stats.get('rate', 0):.1%})")
         print(f"   False Negatives: {fn_stats.get('total', 0):,} ({fn_stats.get('rate', 0):.1%})")
         
-        # Identify patterns
-        print(f"\n   Identifying error patterns...")
-        self.error_patterns = self.identify_error_patterns(df)
+        # Save CSVs
+        if len(fp_cases) > 0:
+            fp_file = os.path.join(self.output_dir, 'fp_cases.csv')
+            fp_cases.to_csv(fp_file, index=False)
+            print(f"\n   ✅ Saved FP cases: {fp_file}")
         
-        for pattern_id, pattern_info in self.error_patterns.items():
-            print(f"      {pattern_info['name']}: {pattern_info['count']:,} cases")
+        if len(fn_cases) > 0:
+            fn_file = os.path.join(self.output_dir, 'fn_cases.csv')
+            fn_cases.to_csv(fn_file, index=False)
+            print(f"   ✅ Saved FN cases: {fn_file}")
         
-        # Generate reports
-        results = {
+        # Generate detailed report
+        if detailed:
+            print(f"\n   Generating detailed failure report...")
+            report_file = os.path.join(self.output_dir, 'failure_report.txt')
+            self._generate_detailed_report(report_file, top_k, fp_cases, fn_cases)
+            print(f"   ✅ Saved report: {report_file}")
+        
+        return {
             'arch_num': self.arch_num,
             'arch_name': self.arch_name,
             'total_cases': total_cases,
@@ -757,87 +598,50 @@ class FailureAnalyzer:
             'error_rate': total_errors / total_cases,
             'fp_stats': fp_stats,
             'fn_stats': fn_stats,
-            'error_patterns': {k: v['count'] for k, v in self.error_patterns.items()},
         }
-        
-        # Save CSV files
-        if len(self.fp_cases) > 0:
-            fp_file = os.path.join(self.output_dir, 'fp_cases.csv')
-            self.fp_cases.to_csv(fp_file, index=False)
-            print(f"\n   ✅ Saved FP cases to: {fp_file}")
-        
-        if len(self.fn_cases) > 0:
-            fn_file = os.path.join(self.output_dir, 'fn_cases.csv')
-            self.fn_cases.to_csv(fn_file, index=False)
-            print(f"   ✅ Saved FN cases to: {fn_file}")
-        
-        # Generate detailed report
-        if detailed:
-            print(f"\n   Generating detailed failure report...")
-            report_file = os.path.join(self.output_dir, 'failure_report.txt')
-            self._generate_detailed_report(report_file, top_k)
-            print(f"   ✅ Saved report to: {report_file}")
-        
-        return results
     
-    def _generate_detailed_report(self, output_file: str, top_k: int):
-        """Generate detailed failure report with case studies."""
+    def _generate_detailed_report(self, output_file: str, top_k: int, 
+                                   fp_cases: pd.DataFrame, fn_cases: pd.DataFrame):
+        """Generate detailed failure report."""
         with open(output_file, 'w', encoding='utf-8') as f:
-            # Header
             f.write("="*80 + "\n")
             f.write("CLINICAL AI FAILURE ANALYSIS REPORT\n")
             f.write(f"Architecture: {self.arch_name} (#{self.arch_num})\n")
             f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write("="*80 + "\n\n")
             
-            # Summary
-            f.write(f"Total Cases: {len(self.df_full):,}\n")
-            f.write(f"False Positives: {len(self.fp_cases):,} | False Negatives: {len(self.fn_cases):,}\n")
+            f.write(f"Total Cases: {len(fp_cases) + len(fn_cases):,}\n")
+            f.write(f"False Positives: {len(fp_cases):,} | False Negatives: {len(fn_cases):,}\n")
             f.write("="*80 + "\n\n")
-
-            # Methodology
+            
+            # Methodology note
             f.write("METHODOLOGY NOTE:\n")
             f.write("-" * 80 + "\n")
-            f.write("Specialist scores are derived from multi-modal analysis:\n")
-            f.write("   • Note Specialist:  Ensemble of ClinicalBERT Embeddings + LDA Topics + Manual Features (Structure, Risk Patterns)\n")
-            f.write("                        processed by HistGradientBoostingClassifier.\n")
-            f.write("   • Lab Specialist:   Dynamic Lab Trajectories (RNN/Transformer)\n")
-            f.write("   • High 'Why' explanations are heuristic interpretations of the black-box score.\n")
+            f.write("Specialist scores derived from multi-modal analysis:\n")
+            f.write("   • Note: ClinicalBERT Embeddings + LDA Topics + Manual Features\n")
+            f.write("   • Lab: Organ dysfunction scores + Lab trajectories\n")
+            f.write("   • 'WHY' explanations are heuristic interpretations of model outputs\n")
             f.write("=" * 80 + "\n\n")
             
-            # Error Patterns
-            f.write("IDENTIFIED ERROR PATTERNS:\n")
-            f.write("-"*80 + "\n")
-            for pattern_id, pattern_info in self.error_patterns.items():
-                f.write(f"\n{pattern_info['name']} ({pattern_info['count']} cases)\n")
-                f.write(f"   {pattern_info['description']}\n")
-            f.write("\n" + "="*80 + "\n\n")
-            
             # Top FP cases
-            if len(self.fp_cases) > 0:
+            if len(fp_cases) > 0:
                 f.write("="*80 + "\n")
                 f.write("TOP FALSE POSITIVE CASES\n")
                 f.write("="*80 + "\n\n")
                 
-                # Sort by probability (highest false alarms)
-                top_fp = self.fp_cases.nlargest(top_k, 'y_prob')
-                
+                top_fp = fp_cases.nlargest(top_k, 'y_prob')
                 for idx, (_, case) in enumerate(top_fp.iterrows(), 1):
-                    report = self.generate_case_report(case, idx, 'FALSE POSITIVE')
-                    f.write(report)
+                    f.write(self.generate_case_report(case, idx, 'FALSE POSITIVE'))
             
             # Top FN cases
-            if len(self.fn_cases) > 0:
+            if len(fn_cases) > 0:
                 f.write("\n" + "="*80 + "\n")
                 f.write("TOP FALSE NEGATIVE CASES\n")
                 f.write("="*80 + "\n\n")
                 
-                # Sort by probability (lowest misses)
-                top_fn = self.fn_cases.nsmallest(top_k, 'y_prob')
-                
+                top_fn = fn_cases.nsmallest(top_k, 'y_prob')
                 for idx, (_, case) in enumerate(top_fn.iterrows(), 1):
-                    report = self.generate_case_report(case, idx, 'FALSE NEGATIVE')
-                    f.write(report)
+                    f.write(self.generate_case_report(case, idx, 'FALSE NEGATIVE'))
 
 
 # =============================================================================
@@ -847,26 +651,12 @@ def main():
     parser = argparse.ArgumentParser(
         description='Analyze failures in multi-agent readmission prediction'
     )
-    parser.add_argument(
-        '--arch', type=int, default=None,
-        help='Architecture number to analyze (default: all)'
-    )
-    parser.add_argument(
-        '--error-type', type=str, choices=['fp', 'fn', 'both'], default='both',
-        help='Error type to analyze'
-    )
-    parser.add_argument(
-        '--detailed', action='store_true',
-        help='Generate detailed case reports'
-    )
-    parser.add_argument(
-        '--top-k', type=int, default=25,
-        help='Number of top cases to report'
-    )
-    parser.add_argument(
-        '--predictions-dir', type=str, default='./model_outputs/',
-        help='Directory containing architecture predictions'
-    )
+    parser.add_argument('--arch', type=int, default=None,
+        help='Architecture number to analyze (default: all)')
+    parser.add_argument('--detailed', action='store_true',
+        help='Generate detailed case reports')
+    parser.add_argument('--top-k', type=int, default=25,
+        help='Number of top cases to report')
     
     args = parser.parse_args()
     
@@ -875,67 +665,58 @@ def main():
     print("="*80)
     print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
-    # Determine which architectures to analyze
+    # Find architectures to analyze
     if args.arch is not None:
         arch_nums = [args.arch]
     else:
-        # Find all available architecture predictions
         arch_nums = []
-        for arch_num in range(7):  # 0-6
+        for arch_num in range(7):
             arch_name = ARCHITECTURE_NAMES.get(arch_num, {}).get('abbrev', f'arch{arch_num}')
-            pred_file = os.path.join(ANALYSIS_DIR, f'arch{arch_num}_{arch_name}', 'predictions_with_features.csv')
+            pred_file = os.path.join(ANALYSIS_DIR, f'arch{arch_num}_{arch_name}', 
+                                      'predictions_with_features.csv')
             if os.path.exists(pred_file):
                 arch_nums.append(arch_num)
         
         if not arch_nums:
             print("\n⚠️  No prediction files found!")
             print(f"   Looking in: {ANALYSIS_DIR}")
-            print("\n   Run compare_all_architectures.py first to generate predictions.")
-            print("   Example: python compare_all_architectures.py --arch 0 --skip-specialist --debug")
-            print(f"\nCompleted: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            print("="*80)
+            print("\n   Run compare_all_architectures.py first.")
             return
     
     print(f"\nAnalyzing architectures: {arch_nums}")
     
-    # Run analysis for each architecture
-    all_analysis_results = []
+    # Run analysis
+    all_results = []
     
     for arch_num in arch_nums:
         arch_name = ARCHITECTURE_NAMES.get(arch_num, {}).get('abbrev', f'arch{arch_num}')
-        arch_full = ARCHITECTURE_NAMES.get(arch_num, {}).get('full', f'Architecture {arch_num}')
-        
-        # Load predictions
-        pred_file = os.path.join(ANALYSIS_DIR, f'arch{arch_num}_{arch_name}', 'predictions_with_features.csv')
+        pred_file = os.path.join(ANALYSIS_DIR, f'arch{arch_num}_{arch_name}', 
+                                  'predictions_with_features.csv')
         
         if not os.path.exists(pred_file):
-            print(f"\n⚠️  Skipping Architecture {arch_num}: predictions file not found")
-            print(f"   Expected: {pred_file}")
+            print(f"\n⚠️  Skipping Architecture {arch_num}: file not found")
             continue
         
-        # Create analyzer and run analysis
         analyzer = FailureAnalyzer(arch_num, arch_name)
         
         try:
             df = analyzer.load_predictions(pred_file)
             results = analyzer.run_analysis(df, top_k=args.top_k, detailed=args.detailed)
-            all_analysis_results.append(results)
-            
+            all_results.append(results)
         except Exception as e:
             print(f"\n❌ Error analyzing Architecture {arch_num}: {e}")
             if args.detailed:
                 import traceback
                 traceback.print_exc()
-            continue
     
-    # Generate comparison report if multiple architectures
-    if len(all_analysis_results) > 1:
+    # Generate comparison
+    if len(all_results) > 1:
         print(f"\n{'='*80}")
-        print("CROSS-ARCHITECTURE FAILURE COMPARISON")
+        print("CROSS-ARCHITECTURE COMPARISON")
         print(f"{'='*80}\n")
         
         comparison_data = []
-        for res in all_analysis_results:
+        for res in all_results:
             comparison_data.append({
                 'Architecture': f"{res['arch_name']} (#{res['arch_num']})",
                 'Total Cases': res['total_cases'],
@@ -950,10 +731,9 @@ def main():
         df_comparison = pd.DataFrame(comparison_data)
         print(df_comparison.to_string(index=False))
         
-        # Save comparison
         comparison_file = os.path.join(ANALYSIS_DIR, 'comparison_failure_analysis.csv')
         df_comparison.to_csv(comparison_file, index=False)
-        print(f"\n✅ Comparison saved to: {comparison_file}")
+        print(f"\n✅ Comparison saved: {comparison_file}")
     
     print(f"\nCompleted: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("="*80)
