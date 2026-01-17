@@ -381,404 +381,352 @@ class LabSpecialist:
 # =============================================================================
 class NoteSpecialist:
     """
-    Clinical notes specialist with ClinicalBERT embeddings.
-    
-    STRICT MODE: Requires SentenceTransformer - no TF-IDF fallback.
-    This ensures maximum accuracy from clinical note analysis.
+    Enhanced Clinical Notes Specialist with negation detection,
+    severity scoring, and context-aware predictions.
     """
-    
+
     def __init__(self) -> None:
-        """Initialize Note Specialist with ClinicalBERT encoder."""
-        self.name = "Spec_Notes"
-        
-        # Load ClinicalBERT encoder (REQUIRED - no fallback)
-        print(f"      Loading ClinicalBERT encoder...")
+        self.name = "Spec_Notes_Enhanced"
+
+        # Embedding model
         self.encoder = SentenceTransformer(
-            'pritamdeka/S-PubMedBert-MS-MARCO', 
+            "pritamdeka/S-PubMedBert-MS-MARCO",
             device=DEVICE
         )
-        print(f"      ✅ NoteSpecialist: ClinicalBERT on {DEVICE.upper()}")
-        
-        # Initialize cache (REQUIRED) - limit to 100K embeddings to prevent memory issues
-        # The cache file persists, but in-memory cache is limited
         self.cache = ClinicalBERTCache(max_cache_size=100000)
-        print(f"      ✅ NoteSpecialist: ClinicalBERT cache enabled (max 100K in-memory)")
-        
+
+        # Predictive model
         self.model = HistGradientBoostingClassifier(
             learning_rate=DEFAULT_LEARNING_RATE,
             max_iter=DEFAULT_MAX_ITER,
             max_depth=DEFAULT_MAX_DEPTH,
             min_samples_leaf=DEFAULT_MIN_SAMPLES_LEAF,
             l2_regularization=DEFAULT_L2_REGULARIZATION,
-            class_weight='balanced',
+            class_weight="balanced",
             random_state=RANDOM_STATE,
             early_stopping=True,
             validation_fraction=0.1,
-            n_iter_no_change=15,
-            tol=1e-7
+            n_iter_no_change=15
         )
+
         self.scaler = StandardScaler()
-        self.manual_feature_names: List[str] = []
-        
-        # LDA Topic Model
+
+        # Topic model
+        self.vectorizer = None
         self.lda = None
-        self.count_vectorizer = None
         self.lda_fitted = False
-        
-        # Pre-compiled patterns for LDA text cleaning
-        self._lda_clean_patterns = {
-            'deident': re.compile(r'\[\*\*[^\]]*\*\*\]'),
-            'punctuation': re.compile(r'[^\w\s]'),
-            'whitespace': re.compile(r'\s+'),
-        }
-        
-        # Section patterns for extraction
+
+        # Section detectors
         self.section_patterns = {
-            'chief_complaint': re.compile(r'(?:chief complaint|cc|reason for admission)[:\s]*', re.IGNORECASE),
-            'history_present_illness': re.compile(r'(?:history of present illness|hpi|present illness)[:\s]*', re.IGNORECASE),
-            'past_medical_history': re.compile(r'(?:past medical history|pmh|medical history)[:\s]*', re.IGNORECASE),
-            'social_history': re.compile(r'(?:social history|sh|social hx)[:\s]*', re.IGNORECASE),
-            'assessment_plan': re.compile(r'(?:assessment and plan|a/p|assessment|impression)[:\s]*', re.IGNORECASE),
-            'discharge_diagnosis': re.compile(r'(?:discharge diagnosis|diagnoses|final diagnosis)[:\s]*', re.IGNORECASE),
-            'discharge_condition': re.compile(r'(?:discharge condition|condition at discharge)[:\s]*', re.IGNORECASE),
-            'discharge_instructions': re.compile(r'(?:discharge instructions|instructions)[:\s]*', re.IGNORECASE),
-            'followup': re.compile(r'(?:follow up|followup|follow-up|appointments)[:\s]*', re.IGNORECASE),
+            "chief_complaint": re.compile(r"chief complaint:", re.I),
+            "hpi": re.compile(r"history of present illness:", re.I),
+            "pmh": re.compile(r"past medical history:", re.I),
+            "social": re.compile(r"social history:", re.I),
+            "assessment": re.compile(r"assessment and plan:", re.I),
+            "discharge_dx": re.compile(r"discharge diagnosis:", re.I),
+            "discharge_condition": re.compile(r"discharge condition:", re.I),
+            "discharge_instructions": re.compile(r"discharge instructions:", re.I),
+            "followup": re.compile(r"follow up:", re.I),
+        }
+
+        # Enhanced clinical patterns
+        self.risk_patterns = {
+            "sepsis": r"sepsis|septic",
+            "shock": r"shock|hypotensive crisis",
+            "respiratory_failure": r"respiratory failure|intubated|ventilator|mechanical ventilation",
+            "cardiac_arrest": r"cardiac arrest|code blue|cpr|resuscitation",
+            "icu_admission": r"icu|intensive care|critical care",
+            "acute_decompensation": r"acute decompensation|acute exacerbation|acute on chronic",
+            "unstable": r"unstable|deteriorating|worsening",
         }
         
-        # Keyword dictionaries
-        self.keywords = get_note_keywords()
-        
-        # Pre-compile keyword patterns for speed
-        self._keyword_patterns = {}
-        for category, words in self.keywords.items():
-            pattern = '|'.join(re.escape(w) for w in words)
-            self._keyword_patterns[category] = re.compile(pattern, re.IGNORECASE)
-        
-        self.is_fitted = False
-    
-    def _clean_text_for_lda(self, text: str) -> str:
-        """Clean text for LDA processing."""
-        text = self._lda_clean_patterns['deident'].sub(' ', text)
-        text = self._lda_clean_patterns['punctuation'].sub(' ', text)
-        text = self._lda_clean_patterns['whitespace'].sub(' ', text.lower())
-        return text.strip()
-    
-    def _fit_lda(self, texts: List[str]) -> None:
-        """Fit LDA topic model on training texts."""
-        import time
-        
-        # Clean texts with progress
-        print(f"               Cleaning {len(texts):,} texts for LDA...")
-        t0 = time.time()
-        cleaned_texts = [self._clean_text_for_lda(t) for t in tqdm(texts, desc="Cleaning", unit="text", leave=False)]
-        print(f"               ✓ Text cleaning took {time.time()-t0:.1f}s")
-        
-        # Build vocabulary
-        print(f"               Building vocabulary (max_features=1000)...")
-        t0 = time.time()
-        self.count_vectorizer = CountVectorizer(
-            max_features=1000,  # Reduced for performance
-            min_df=50,  # Increased to reduce vocabulary on large datasets
-            max_df=0.7,  # More aggressive filtering
-            stop_words='english',
-            ngram_range=(1, 1)  # Unigrams only for speed
+        self.protective_patterns = {
+            "stable": r"stable|improving|improved|good progress",
+            "family_support": r"family.*(?:support|present|involved)|(?:daughter|son|spouse|wife|husband).*(?:support|care|help)",
+            "followup_scheduled": r"follow(?:-|\s)up.*(?:scheduled|arranged|appointment)|appointment.*(?:made|scheduled)",
+            "home_services": r"home health|visiting nurse|vna|home care",
+            "patient_education": r"patient.*(?:understands|educated|verbalized understanding|demonstrates understanding)",
+            "compliance": r"compliant|adherent|cooperative|agrees to.*plan",
+            "supervised_discharge": r"(?:discharge|going).*(?:snf|rehab|skilled nursing|rehabilitation)",
+        }
+
+        # Negation patterns
+        self.negation_pattern = re.compile(
+            r"\b(no|not|without|denies|denied|negative for|ruled out|absence of|free of)\b",
+            re.I
         )
         
-        doc_term_matrix = self.count_vectorizer.fit_transform(cleaned_texts)
-        vocab_size = len(self.count_vectorizer.vocabulary_)
-        print(f"               ✓ Vocabulary built: {vocab_size} terms, took {time.time()-t0:.1f}s")
+        # Severity modifiers
+        self.severity_high = re.compile(r"\b(severe|critical|acute|life-threatening|emergent)\b", re.I)
+        self.severity_low = re.compile(r"\b(mild|minor|slight|minimal)\b", re.I)
         
-        # Fit LDA model
-        print(f"               Fitting LDA ({LDA_N_TOPICS} topics, {LDA_MAX_ITER} iterations)...")
-        t0 = time.time()
+        # Trajectory patterns
+        self.improving_pattern = re.compile(r"\b(improving|improved|better|resolved|resolving|stable)\b", re.I)
+        self.worsening_pattern = re.compile(r"\b(worsening|worse|declining|deteriorating|progressive)\b", re.I)
+
+        self.is_fitted = False
+
+    def _normalize_note(self, text: str) -> str:
+        """Normalize note structure."""
+        if not text:
+            return ""
+        
+        text = text.strip()
+        
+        # If already structured, keep as-is
+        if any(p.search(text) for p in self.section_patterns.values()):
+            return text[:3500]
+        
+        # Otherwise, wrap raw text
+        return (
+            "Chief Complaint: UNCLEAR\n"
+            f"History of Present Illness: {text}\n"
+            "Past Medical History: UNCLEAR\n"
+            "Social History: UNCLEAR\n"
+            "Assessment and Plan: UNCLEAR\n"
+            "Discharge Diagnosis: UNCLEAR\n"
+            "Discharge Condition: UNCLEAR\n"
+            "Discharge Instructions: UNCLEAR\n"
+            "Follow Up: UNCLEAR"
+        )[:3500]
+
+    def _extract_sections(self, text: str) -> Dict[str, str]:
+        """Extract individual sections from note."""
+        sections = {}
+        text_lower = text.lower()
+        
+        for section_name, pattern in self.section_patterns.items():
+            match = pattern.search(text)
+            if match:
+                start = match.end()
+                # Find next section or end of text
+                next_starts = []
+                for other_pattern in self.section_patterns.values():
+                    if other_pattern != pattern:
+                        next_match = other_pattern.search(text, start)
+                        if next_match:
+                            next_starts.append(next_match.start())
+                
+                end = min(next_starts) if next_starts else len(text)
+                sections[section_name] = text[start:end].strip()
+            else:
+                sections[section_name] = ""
+        
+        return sections
+
+    def _check_negation(self, text: str, pattern: str, window: int = 50) -> Tuple[int, int]:
+        """
+        Check for both presence and negated presence of a pattern.
+        
+        Returns:
+            (affirmed_count, negated_count)
+        """
+        affirmed = 0
+        negated = 0
+        
+        # Find all matches
+        for match in re.finditer(pattern, text, re.I):
+            start = max(0, match.start() - window)
+            end = min(len(text), match.end() + window)
+            context = text[start:end]
+            
+            # Check if negation appears before the match
+            if self.negation_pattern.search(context[:match.start()-start]):
+                negated += 1
+            else:
+                affirmed += 1
+        
+        return affirmed, negated
+
+    def _score_severity(self, text: str) -> float:
+        """Score clinical severity based on modifiers."""
+        high_count = len(self.severity_high.findall(text))
+        low_count = len(self.severity_low.findall(text))
+        
+        # Normalize to -1 (low) to +1 (high)
+        total = high_count + low_count
+        if total == 0:
+            return 0.0
+        
+        return (high_count - low_count) / total
+
+    def _get_trajectory(self, text: str) -> float:
+        """Assess clinical trajectory (improving vs worsening)."""
+        improving = len(self.improving_pattern.findall(text))
+        worsening = len(self.worsening_pattern.findall(text))
+        
+        total = improving + worsening
+        if total == 0:
+            return 0.0
+        
+        # -1 (worsening) to +1 (improving)
+        return (improving - worsening) / total
+
+    def _embed_notes(self, texts: List[str]) -> np.ndarray:
+        """Generate embeddings with caching."""
+        embeddings = []
+        for t in tqdm(texts, desc="      [Note] Embedding", unit="note", leave=False):
+            cached = self.cache.get(t)
+            if cached is not None:
+                embeddings.append(cached)
+            else:
+                emb = self.encoder.encode(t[:512], convert_to_numpy=True)
+                self.cache.set(t, emb)
+                embeddings.append(emb)
+        return np.vstack(embeddings)
+
+    def _topic_features(self, texts: List[str]) -> np.ndarray:
+        """Extract topic model features."""
+        if not self.lda_fitted:
+            return np.zeros((len(texts), LDA_N_TOPICS))
+
+        cleaned = [re.sub(r"[^\w\s]", " ", t.lower()) for t in 
+                   tqdm(texts, desc="      [Note] Cleaning for LDA", unit="note", leave=False)]
+        dtm = self.vectorizer.transform(cleaned)
+        return self.lda.transform(dtm)
+
+    def _manual_features(self, texts: List[str], X_context: pd.DataFrame) -> pd.DataFrame:
+        """
+        Extract enhanced manual features with negation detection,
+        severity scoring, and context awareness.
+        """
+        rows = []
+
+        for idx, text in enumerate(tqdm(texts, desc="      [Note] Manual features", unit="note", leave=False)):
+            text_lower = text.lower()
+            f = {
+                "length": len(text_lower),
+                "word_count": len(text_lower.split()),
+            }
+
+            # Section presence
+            for section_name, pattern in self.section_patterns.items():
+                f[f"has_{section_name}"] = 1 if pattern.search(text) else 0
+
+            # Risk patterns with negation awareness
+            for risk_name, risk_pattern in self.risk_patterns.items():
+                affirmed, negated = self._check_negation(text, risk_pattern)
+                f[f"{risk_name}_affirmed"] = affirmed
+                f[f"{risk_name}_negated"] = negated
+                f[f"{risk_name}_net"] = affirmed - negated
+
+            # Protective patterns with negation awareness
+            for prot_name, prot_pattern in self.protective_patterns.items():
+                affirmed, negated = self._check_negation(text, prot_pattern)
+                f[f"{prot_name}_affirmed"] = affirmed
+                f[f"{prot_name}_negated"] = negated
+                f[f"{prot_name}_net"] = affirmed - negated
+
+            # Severity and trajectory
+            f["severity_score"] = self._score_severity(text)
+            f["trajectory_score"] = self._get_trajectory(text)
+
+            # Aggregate risk/protective scores
+            f["total_risk_score"] = sum(f.get(f"{r}_net", 0) for r in self.risk_patterns.keys())
+            f["total_protective_score"] = sum(f.get(f"{p}_net", 0) for p in self.protective_patterns.keys())
+            f["net_clinical_risk"] = f["total_risk_score"] - f["total_protective_score"]
+
+            # Context-aware modulation
+            if idx < len(X_context):
+                ctx = X_context.iloc[idx] if isinstance(X_context, pd.DataFrame) else X_context[idx]
+                
+                # If ICU patient, weight risk factors more
+                if isinstance(ctx, (pd.Series, dict)) and ctx.get('had_icu_stay', 0):
+                    f["risk_icu_interaction"] = f["total_risk_score"] * 1.5
+                else:
+                    f["risk_icu_interaction"] = f["total_risk_score"]
+                
+                # If elderly, weight certain risks more
+                if isinstance(ctx, (pd.Series, dict)):
+                    age = ctx.get('anchor_age', 0) or ctx.get('age', 0)
+                    if age > 75:
+                        f["risk_age_interaction"] = f["total_risk_score"] * 1.3
+                    else:
+                        f["risk_age_interaction"] = f["total_risk_score"]
+
+            # Discharge quality indicators
+            f["has_discharge_plan"] = 1 if re.search(
+                r"discharge.*plan|plan.*discharge|discharge.*instructions", text_lower
+            ) else 0
+            
+            f["has_medication_list"] = 1 if re.search(
+                r"medications?.*(?:list|prescribed|discharge)|discharge.*medications?", text_lower
+            ) else 0
+
+            rows.append(f)
+
+        return pd.DataFrame(rows).fillna(0)
+
+    def learn(self, texts: List[str], X_context: pd.DataFrame, y: np.ndarray) -> None:
+        """Train the note specialist with all enhancements."""
+        # Normalize
+        texts = [self._normalize_note(t) for t in 
+                 tqdm(texts, desc="      [Note] Normalizing", unit="note", leave=False)]
+
+        # Topic model with FIXED min_df
+        cleaned = [re.sub(r"[^\w\s]", " ", t.lower()) for t in texts]
+        self.vectorizer = CountVectorizer(
+            max_features=1000,
+            min_df=5,  # CHANGED from 50 - captures rare medical terms
+            stop_words="english"
+        )
+        dtm = self.vectorizer.fit_transform(cleaned)
+
         self.lda = LatentDirichletAllocation(
             n_components=LDA_N_TOPICS,
             max_iter=LDA_MAX_ITER,
-            learning_method='online',
-            random_state=RANDOM_STATE,
-            n_jobs=1,
-            verbose=1  # Show LDA fitting progress
+            learning_method="online",
+            random_state=RANDOM_STATE
         )
-        self.lda.fit(doc_term_matrix)
-        print(f"               ✓ LDA model fitted in {time.time()-t0:.1f}s")
+        self.lda.fit(dtm)
         self.lda_fitted = True
-    
-    def _get_lda_features(self, texts: List[str]) -> np.ndarray:
-        """Get LDA topic distribution for texts."""
-        import time
-        if not self.lda_fitted:
-            return np.zeros((len(texts), LDA_N_TOPICS))
-        
-        # Clean texts with progress for large datasets
-        t0 = time.time()
-        if len(texts) > 5000:
-            cleaned_texts = [self._clean_text_for_lda(t) for t in tqdm(texts, desc="LDA clean", unit="text", leave=False)]
-        else:
-            cleaned_texts = [self._clean_text_for_lda(t) for t in texts]
-        
-        # Transform to topic distributions
-        doc_term_matrix = self.count_vectorizer.transform(cleaned_texts)
-        topic_distributions = self.lda.transform(doc_term_matrix)
-        
-        return topic_distributions
-    
-    def _extract_section(self, text: str, section_name: str) -> str:
-        """Extract a specific section from clinical note."""
-        if section_name not in self.section_patterns:
-            return ""
-        
-        pattern = self.section_patterns[section_name]
-        match = pattern.search(text)
-        
-        if not match:
-            return ""
-        
-        start = match.end()
-        next_section = len(text)
-        
-        for other_name, other_pattern in self.section_patterns.items():
-            if other_name != section_name:
-                other_match = other_pattern.search(text[start:])
-                if other_match:
-                    next_section = min(next_section, start + other_match.start())
-        
-        return text[start:next_section].strip()[:2000]
-    
-    def _extract_manual_features(self, texts: List[str]) -> pd.DataFrame:
-        """Extract interpretable manual features from text."""
-        features_list = []
-        
-        # Add progress bar for large datasets
-        text_iter = tqdm(texts, desc="Manual features", unit="text", leave=False) if len(texts) > 1000 else texts
-        
-        for text in text_iter:
-            text_lower = text.lower() if text else ""
-            features = {}
-            
-            # Text statistics
-            features['text_length'] = len(text_lower)
-            features['word_count'] = len(text_lower.split())
-            features['sentence_count'] = text_lower.count('.') + text_lower.count('!') + text_lower.count('?')
-            features['unique_word_ratio'] = len(set(text_lower.split())) / max(1, len(text_lower.split()))
-            
-            # Keyword counts
-            for category, pattern in self._keyword_patterns.items():
-                matches = pattern.findall(text_lower)
-                features[f'kw_{category}_count'] = len(matches)
-                features[f'kw_{category}_present'] = 1 if matches else 0
-            
-            # Section presence
-            for section_name in self.section_patterns.keys():
-                section_text = self._extract_section(text, section_name)
-                features[f'has_{section_name}'] = 1 if section_text else 0
-                features[f'{section_name}_length'] = len(section_text)
-            
-            # Risk vs Protective balance
-            risk_count = features.get('kw_high_risk_count', 0) + features.get('kw_readmission_risk_count', 0)
-            protective_count = features.get('kw_protective_count', 0) + features.get('kw_discharge_ready_count', 0)
-            features['risk_protective_ratio'] = risk_count / max(1, protective_count)
-            features['net_risk_score'] = risk_count - protective_count
-            
-            # Specific clinical patterns
-            features['mentions_family_support'] = 1 if re.search(r'family.*(support|present|bedside)', text_lower) else 0
-            features['mentions_follow_up'] = 1 if re.search(r'follow.?up.*(appt|appointment|scheduled)', text_lower) else 0
-            features['mentions_home_health'] = 1 if re.search(r'home health|vna|visiting nurse', text_lower) else 0
-            features['mentions_snf_rehab'] = 1 if re.search(r'snf|skilled nursing|rehab', text_lower) else 0
-            features['mentions_ama'] = 1 if re.search(r'against medical advice|ama|left ama', text_lower) else 0
-            features['mentions_noncompliance'] = 1 if re.search(r'non.?compli|non.?adher', text_lower) else 0
-            
-            # Stability indicators
-            features['is_stable'] = 1 if re.search(r'stable|at baseline|doing well', text_lower) else 0
-            features['is_unstable'] = 1 if re.search(r'unstable|deteriorat|worsen', text_lower) else 0
-            
-            features_list.append(features)
-        
-        return pd.DataFrame(features_list)
-    
-    def _get_embeddings_cached(self, texts: List[str]) -> np.ndarray:
-        """Get ClinicalBERT embeddings with caching (memory-optimized)."""
-        n_texts = len(texts)
-        texts_to_encode = []
-        indices_to_encode = []
-        cached_indices = []
-        cached_embeddings = []
-        
-        # Check cache first - collect cached and uncached separately
-        for i, text in enumerate(texts):
-            cached = self.cache.get(text)
-            if cached is not None:
-                cached_indices.append(i)
-                cached_embeddings.append(cached)
-            else:
-                texts_to_encode.append(text[:512])  # Truncate for BERT
-                indices_to_encode.append(i)
-        
-        # Pre-allocate output array (memory-efficient)
-        if cached_embeddings:
-            embedding_dim = cached_embeddings[0].shape[0]
-        else:
-            # If no cache, we'll get dim from first encoding
-            embedding_dim = 768  # Default ClinicalBERT dimension
-        
-        result = np.zeros((n_texts, embedding_dim), dtype=np.float32)
-        
-        # Fill in cached embeddings
-        for idx, emb in zip(cached_indices, cached_embeddings):
-            result[idx] = emb
-        
-        # Encode uncached texts
-        if texts_to_encode:
-            new_embeddings = self.encoder.encode(
-                texts_to_encode,
-                show_progress_bar=True,
-                batch_size=32,
-                convert_to_numpy=True
-            )
-            
-            # Update embedding_dim if needed
-            if new_embeddings.shape[1] != embedding_dim:
-                embedding_dim = new_embeddings.shape[1]
-                # Resize result array if needed
-                if result.shape[1] != embedding_dim:
-                    new_result = np.zeros((n_texts, embedding_dim), dtype=np.float32)
-                    new_result[:, :result.shape[1]] = result[:, :result.shape[1]]
-                    result = new_result
-            
-            # Fill in new embeddings and cache them (optimized batch operation)
-            n_new = len(new_embeddings)
-            
-            # Process with progress bar for better visibility
-            if n_new > 100:
-                print(f"      📦 Caching {n_new:,} new embeddings...")
-                cache_iter = tqdm(
-                    zip(indices_to_encode, texts_to_encode, new_embeddings),
-                    total=n_new,
-                    desc="Caching",
-                    unit="emb",
-                    leave=True
-                )
-            else:
-                cache_iter = zip(indices_to_encode, texts_to_encode, new_embeddings)
-            
-            for idx, text, emb in cache_iter:
-                result[idx] = emb
-                self.cache.set(text, emb)
-        
-        return result
-    
-    def learn(self, texts: List[str], X_context: pd.DataFrame, y: np.ndarray) -> None:
-        """Train the note specialist."""
-        import time
-        total_start = time.time()
-        
-        # Step 1: Fit LDA on training texts
-        print(f"      [Step 1/6] Fitting LDA topic model...")
-        t0 = time.time()
-        self._fit_lda(texts)
-        print(f"               ✓ LDA fitting took {time.time()-t0:.1f}s")
-        
-        # Step 2: Get ClinicalBERT embeddings
-        print(f"      [Step 2/6] Encoding {len(texts):,} texts with ClinicalBERT...")
-        print_memory_usage("Before encoding")
-        t0 = time.time()
-        embeddings = self._get_embeddings_cached(texts)
-        print(f"               ✓ Encoding took {time.time()-t0:.1f}s")
-        print_memory_usage("After encoding")
-        gc.collect()  # Free memory from encoding process
-        
-        # Step 3: Get LDA features
-        print(f"      [Step 3/6] Extracting LDA topic features for {len(texts):,} texts...")
-        t0 = time.time()
-        lda_features = self._get_lda_features(texts)
-        print(f"               ✓ LDA extraction took {time.time()-t0:.1f}s")
-        gc.collect()
-        
-        # Step 4: Get manual features
-        print(f"      [Step 4/6] Extracting {len(texts):,} manual keyword features...")
-        t0 = time.time()
-        manual_features = self._extract_manual_features(texts)
-        print(f"               ✓ Manual extraction took {time.time()-t0:.1f}s")
-        gc.collect()
-        self.manual_feature_names = manual_features.columns.tolist()
-        
-        # Step 5: Combine all features
-        print(f"      [Step 5/6] Combining features (BERT:{embeddings.shape[1]} + LDA:{lda_features.shape[1]} + Manual:{len(manual_features.columns)})...")
-        t0 = time.time()
-        
-        X_combined = np.hstack([
-            embeddings,
-            lda_features,
-            manual_features.fillna(0).values
-        ])
-        print(f"               ✓ Feature combination took {time.time()-t0:.1f}s → {X_combined.shape[1]} total features")
-        
-        # Step 6: Scale and train model
-        print(f"      [Step 6/6] Scaling and training HistGradientBoostingClassifier on {len(y):,} samples...")
-        t0 = time.time()
-        X_scaled = self.scaler.fit_transform(X_combined)
-        print(f"               ✓ Scaling took {time.time()-t0:.1f}s")
-        
-        t0 = time.time()
-        print(f"               Training model (this may take 5-15 minutes)...")
-        self.model.fit(X_scaled, y)
-        print(f"               ✓ Model training took {(time.time()-t0)/60:.1f} minutes")
+
+        # Extract all feature types
+        emb = self._embed_notes(texts)
+        lda = self._topic_features(texts)
+        man = self._manual_features(texts, X_context).values
+
+        # IMPORTANT: Include basic context features
+        context_features = X_context[['had_icu_stay', 'anchor_age', 'los_days']].fillna(0).values \
+            if all(col in X_context.columns for col in ['had_icu_stay', 'anchor_age', 'los_days']) \
+            else np.zeros((len(texts), 3))
+
+        # Combine all features
+        X = np.hstack([emb, lda, man, context_features])
+        Xs = self.scaler.fit_transform(X)
+
+        self.model.fit(Xs, y)
+        self.cache.save()
         self.is_fitted = True
-        
-        # Save cache after successful training
-        try:
-            self.cache.save()
-            print(f"      [CACHE] Saved {len(self.cache.cache)} embeddings to cache")
-        except Exception as e:
-            print(f"      [CACHE] Warning: Failed to save cache: {e}")
-        
-        total_time = time.time() - total_start
-        print(f"      ✅ NoteSpecialist trained in {total_time/60:.1f} min with {X_combined.shape[1]} features "
-              f"({embeddings.shape[1]} BERT + {lda_features.shape[1]} LDA + {len(self.manual_feature_names)} manual)")
-    
+
     def give_opinion(self, texts: List[str], X_context: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
-        """Generate probability predictions."""
-        import time
+        """Generate predictions with all enhancements."""
         if not self.is_fitted:
-            raise RuntimeError("NoteSpecialist must be trained before giving opinions!")
-        
-        n_texts = len(texts)
-        show_progress = n_texts > 5000
-        
-        if show_progress:
-            print(f"      [NoteSpecialist] Processing {n_texts:,} texts for inference...")
-        
-        # Get embeddings
-        t0 = time.time()
-        embeddings = self._get_embeddings_cached(texts)
-        if show_progress:
-            print(f"               ✓ Embeddings: {time.time()-t0:.1f}s")
-        
-        # Get LDA features
-        t0 = time.time()
-        lda_features = self._get_lda_features(texts)
-        if show_progress:
-            print(f"               ✓ LDA features: {time.time()-t0:.1f}s")
-        
-        # Get manual features
-        t0 = time.time()
-        manual_features = self._extract_manual_features(texts)
-        if show_progress:
-            print(f"               ✓ Manual features: {time.time()-t0:.1f}s")
-        
+            raise RuntimeError("NoteSpecialist must be trained first")
+
+        # Normalize
+        texts = [self._normalize_note(t) for t in 
+                 tqdm(texts, desc="      [Note] Normalizing (Inference)", unit="note", leave=False)]
+
+        # Extract features
+        emb = self._embed_notes(texts)
+        lda = self._topic_features(texts)
+        man = self._manual_features(texts, X_context).values
+
+        # Context features
+        context_features = X_context[['had_icu_stay', 'anchor_age', 'los_days']].fillna(0).values \
+            if all(col in X_context.columns for col in ['had_icu_stay', 'anchor_age', 'los_days']) \
+            else np.zeros((len(texts), 3))
+
         # Combine
-        X_combined = np.hstack([
-            embeddings,
-            lda_features,
-            manual_features.fillna(0).values
-        ])
-        
-        X_scaled = self.scaler.transform(X_combined)
-        probs = self.model.predict_proba(X_scaled)[:, 1]
-        
-        # Has data if text is meaningful
+        X = np.hstack([emb, lda, man, context_features])
+        Xs = self.scaler.transform(X)
+
+        probs = self.model.predict_proba(Xs)[:, 1]
         has_data = np.array([1.0 if len(t.strip()) > 50 else 0.0 for t in texts])
-        
+
         return probs, has_data
+
 
 
 # =============================================================================

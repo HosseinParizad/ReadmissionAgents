@@ -376,13 +376,16 @@ class ContextConditionalCalibrator:
 # SHARED DATA MANAGEMENT
 # =============================================================================
 def train_specialists_and_save_oof(df_train: pd.DataFrame, df_test: pd.DataFrame,
-                                    n_folds: int = 5) -> Tuple[pd.DataFrame, pd.DataFrame]:
+                                    n_folds: int = 5, update_specialists: List[str] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Train all specialists using K-Fold CV and save OOF predictions.
     This is run ONCE and shared by all architectures.
     """
+    if update_specialists is None:
+        update_specialists = ['lab', 'note', 'pharm', 'hist', 'psych']
+        
     print("\n" + "=" * 70)
-    print("PHASE 1: TRAINING SPECIALISTS (SHARED)")
+    print(f"PHASE 1: TRAINING SPECIALISTS (SHARED) - UPDATING: {update_specialists}")
     print("=" * 70)
     
     y_train = df_train[TARGET].values
@@ -394,7 +397,10 @@ def train_specialists_and_save_oof(df_train: pd.DataFrame, df_test: pd.DataFrame
     print(f"   Test samples: {n_test:,}")
     print(f"   Using {n_folds}-Fold CV for OOF predictions")
     
-    # Initialize OOF arrays
+    # Initialize OOF arrays (load existing if available)
+    oof_path = os.path.join(SHARED_DIR, 'oof_predictions.csv')
+    
+    # Defaults
     oof_train = {
         'lab': np.zeros(n_train),
         'note': np.zeros(n_train),
@@ -405,8 +411,28 @@ def train_specialists_and_save_oof(df_train: pd.DataFrame, df_test: pd.DataFrame
         'psych_care': np.zeros(n_train),
         'psych_social': np.zeros(n_train),
     }
-    
     oof_test = {name: np.zeros(n_test) for name in oof_train.keys()}
+    
+    if os.path.exists(oof_path):
+        print(f"   Loading existing OOF predictions from {oof_path}...")
+        try:
+            existing_oof = pd.read_csv(oof_path)
+            e_train = existing_oof[existing_oof['split'] == 'train'].reset_index(drop=True)
+            e_test = existing_oof[existing_oof['split'] == 'test'].reset_index(drop=True)
+            
+            # Use columns if they exist and shapes match
+            if len(e_train) == n_train and len(e_test) == n_test:
+                for col in oof_train.keys():
+                    csv_col = f"op_{col}"
+                    if csv_col in existing_oof.columns:
+                        oof_train[col] = e_train[csv_col].values
+                        oof_test[col] = e_test[csv_col].values
+                print("   ✅ Loaded existing predictions (will overwrite updated specialists)")
+            else:
+                print("   ⚠️ Feature shape mismatch (data changed?), starting from scratch")
+        except Exception as e:
+            print(f"   ⚠️ Failed to load existing OOF: {e}")
+    
     
     # K-Fold training
     kf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=RANDOM_STATE)
@@ -425,59 +451,66 @@ def train_specialists_and_save_oof(df_train: pd.DataFrame, df_test: pd.DataFrame
         X_labs_train = _prepare_lab_features(df_fold_train)
         X_labs_val = _prepare_lab_features(df_fold_val)
         
-        # Train specialists
-        print(f"       Training Lab specialist...", end=" ", flush=True)
-        spec_lab = LabSpecialist()
-        spec_lab.learn(X_labs_train, X_ctx_train, y_fold_train)
-        op_lab, _ = spec_lab.give_opinion(X_labs_val, X_ctx_val)
-        oof_train['lab'][fold_val_idx] = op_lab
-        print(f"AUC: {roc_auc_score(y_train[fold_val_idx], op_lab):.4f}")
+        # Train specialists (CONDITIONAL)
+        if 'lab' in update_specialists:
+            print(f"       Training Lab specialist...", end=" ", flush=True)
+            spec_lab = LabSpecialist()
+            spec_lab.learn(X_labs_train, X_ctx_train, y_fold_train)
+            op_lab, _ = spec_lab.give_opinion(X_labs_val, X_ctx_val)
+            oof_train['lab'][fold_val_idx] = op_lab
+            print(f"AUC: {roc_auc_score(y_train[fold_val_idx], op_lab):.4f}")
+            del spec_lab
         
-        print(f"       Training Note specialist...", end=" ", flush=True)
-        spec_note = NoteSpecialist()
-        spec_note.learn(df_fold_train['clinical_text'].fillna('').tolist(), X_ctx_train, y_fold_train)
-        op_note, _ = spec_note.give_opinion(df_fold_val['clinical_text'].fillna('').tolist(), X_ctx_val)
-        oof_train['note'][fold_val_idx] = op_note
-        print(f"AUC: {roc_auc_score(y_train[fold_val_idx], op_note):.4f}")
+        if 'note' in update_specialists:
+            print(f"       Training Note specialist...", end=" ", flush=True)
+            spec_note = NoteSpecialist()
+            spec_note.learn(df_fold_train['clinical_text'].fillna('').tolist(), X_ctx_train, y_fold_train)
+            op_note, _ = spec_note.give_opinion(df_fold_val['clinical_text'].fillna('').tolist(), X_ctx_val)
+            oof_train['note'][fold_val_idx] = op_note
+            print(f"AUC: {roc_auc_score(y_train[fold_val_idx], op_note):.4f}")
+            del spec_note
         
-        print(f"       Training Pharmacy specialist...", end=" ", flush=True)
-        spec_pharm = PharmacySpecialist()
-        spec_pharm.learn(df_fold_train['med_list_text'].fillna('').tolist(), X_ctx_train, y_fold_train)
-        op_pharm, _ = spec_pharm.give_opinion(df_fold_val['med_list_text'].fillna('').tolist(), X_ctx_val)
-        oof_train['pharm'][fold_val_idx] = op_pharm
-        print(f"AUC: {roc_auc_score(y_train[fold_val_idx], op_pharm):.4f}")
-        
-        print(f"       Training History specialist...", end=" ", flush=True)
-        spec_hist = HistorySpecialist()
-        spec_hist.learn(df_fold_train['full_history_text'].fillna('').tolist(), X_ctx_train, y_fold_train)
-        op_hist, _ = spec_hist.give_opinion(df_fold_val['full_history_text'].fillna('').tolist(), X_ctx_val)
-        oof_train['hist'][fold_val_idx] = op_hist
-        print(f"AUC: {roc_auc_score(y_train[fold_val_idx], op_hist):.4f}")
-        
-        print(f"       Training Psychosocial specialist...", end=" ", flush=True)
-        spec_psych = PsychosocialSpecialist()
-        spec_psych.learn(
-            df_fold_train['clinical_text'].fillna('').tolist(), X_ctx_train, y_fold_train,
-            med_list=df_fold_train['med_list_text'].fillna('').tolist()
-        )
-        op_psych, _, psych_sub = spec_psych.give_opinion(
-            df_fold_val['clinical_text'].fillna('').tolist(), X_ctx_val,
-            med_list=df_fold_val['med_list_text'].fillna('').tolist()
-        )
-        oof_train['psych'][fold_val_idx] = op_psych
-        oof_train['psych_mental'][fold_val_idx] = psych_sub['mental']
-        oof_train['psych_care'][fold_val_idx] = psych_sub['care']
-        oof_train['psych_social'][fold_val_idx] = psych_sub['social']
-        print(f"AUC: {roc_auc_score(y_train[fold_val_idx], op_psych):.4f}")
+        if 'pharm' in update_specialists:
+            print(f"       Training Pharmacy specialist...", end=" ", flush=True)
+            spec_pharm = PharmacySpecialist()
+            spec_pharm.learn(df_fold_train['med_list_text'].fillna('').tolist(), X_ctx_train, y_fold_train)
+            op_pharm, _ = spec_pharm.give_opinion(df_fold_val['med_list_text'].fillna('').tolist(), X_ctx_val)
+            oof_train['pharm'][fold_val_idx] = op_pharm
+            print(f"AUC: {roc_auc_score(y_train[fold_val_idx], op_pharm):.4f}")
+            del spec_pharm
+            
+        if 'hist' in update_specialists:
+            print(f"       Training History specialist...", end=" ", flush=True)
+            spec_hist = HistorySpecialist()
+            spec_hist.learn(df_fold_train['full_history_text'].fillna('').tolist(), X_ctx_train, y_fold_train)
+            op_hist, _ = spec_hist.give_opinion(df_fold_val['full_history_text'].fillna('').tolist(), X_ctx_val)
+            oof_train['hist'][fold_val_idx] = op_hist
+            print(f"AUC: {roc_auc_score(y_train[fold_val_idx], op_hist):.4f}")
+            del spec_hist
+            
+        if 'psych' in update_specialists:
+            print(f"       Training Psychosocial specialist...", end=" ", flush=True)
+            spec_psych = PsychosocialSpecialist()
+            spec_psych.learn(
+                df_fold_train['clinical_text'].fillna('').tolist(), X_ctx_train, y_fold_train,
+                med_list=df_fold_train['med_list_text'].fillna('').tolist()
+            )
+            op_psych, _, psych_sub = spec_psych.give_opinion(
+                df_fold_val['clinical_text'].fillna('').tolist(), X_ctx_val,
+                med_list=df_fold_val['med_list_text'].fillna('').tolist()
+            )
+            oof_train['psych'][fold_val_idx] = op_psych
+            oof_train['psych_mental'][fold_val_idx] = psych_sub['mental']
+            oof_train['psych_care'][fold_val_idx] = psych_sub['care']
+            oof_train['psych_social'][fold_val_idx] = psych_sub['social']
+            print(f"AUC: {roc_auc_score(y_train[fold_val_idx], op_psych):.4f}")
+            del spec_psych
         
         # === MEMORY CLEANUP BETWEEN FOLDS ===
         print(f"       🧹 Cleaning up fold {fold_idx + 1} memory...")
-        # Delete specialist objects (they hold large models and embeddings)
-        del spec_lab, spec_note, spec_pharm, spec_hist, spec_psych
         # Delete fold-specific data
         del df_fold_train, df_fold_val, y_fold_train
         del X_ctx_train, X_ctx_val, X_labs_train, X_labs_val
-        del op_lab, op_note, op_pharm, op_hist, op_psych, psych_sub
         # Force garbage collection
         gc.collect()
         # Clear GPU cache if available
@@ -500,7 +533,7 @@ def train_specialists_and_save_oof(df_train: pd.DataFrame, df_test: pd.DataFrame
         print(f"       {name:8s}: {roc_auc_score(y_train, oof_train[name]):.4f}")
     
     # Retrain on full training data for test predictions
-    print(f"\n   🔄 Retraining specialists on full training data...")
+    print(f"\n   🔄 Retraining specialists on full training data (UPDATES ONLY)...")
     
     X_ctx_full = _create_context_features(df_train)
     X_ctx_test = _create_context_features(df_test)
@@ -508,59 +541,64 @@ def train_specialists_and_save_oof(df_train: pd.DataFrame, df_test: pd.DataFrame
     X_labs_test = _prepare_lab_features(df_test)
     
     # Lab
-    print(f"       Training Lab...", end=" ", flush=True)
-    spec_lab = LabSpecialist()
-    spec_lab.learn(X_labs_full, X_ctx_full, y_train)
-    oof_test['lab'], _ = spec_lab.give_opinion(X_labs_test, X_ctx_test)
-    print(f"Test AUC: {roc_auc_score(y_test, oof_test['lab']):.4f}")
-    with open(os.path.join(SHARED_DIR, 'specialist_lab.pkl'), 'wb') as f:
-        pickle.dump(spec_lab, f)
+    if 'lab' in update_specialists:
+        print(f"       Training Lab...", end=" ", flush=True)
+        spec_lab = LabSpecialist()
+        spec_lab.learn(X_labs_full, X_ctx_full, y_train)
+        oof_test['lab'], _ = spec_lab.give_opinion(X_labs_test, X_ctx_test)
+        print(f"Test AUC: {roc_auc_score(y_test, oof_test['lab']):.4f}")
+        with open(os.path.join(SHARED_DIR, 'specialist_lab.pkl'), 'wb') as f:
+            pickle.dump(spec_lab, f)
     
     # Note
-    print(f"       Training Note...", end=" ", flush=True)
-    spec_note = NoteSpecialist()
-    spec_note.learn(df_train['clinical_text'].fillna('').tolist(), X_ctx_full, y_train)
-    oof_test['note'], _ = spec_note.give_opinion(df_test['clinical_text'].fillna('').tolist(), X_ctx_test)
-    print(f"Test AUC: {roc_auc_score(y_test, oof_test['note']):.4f}")
-    with open(os.path.join(SHARED_DIR, 'specialist_note.pkl'), 'wb') as f:
-        pickle.dump(spec_note, f)
+    if 'note' in update_specialists:
+        print(f"       Training Note...", end=" ", flush=True)
+        spec_note = NoteSpecialist()
+        spec_note.learn(df_train['clinical_text'].fillna('').tolist(), X_ctx_full, y_train)
+        oof_test['note'], _ = spec_note.give_opinion(df_test['clinical_text'].fillna('').tolist(), X_ctx_test)
+        print(f"Test AUC: {roc_auc_score(y_test, oof_test['note']):.4f}")
+        with open(os.path.join(SHARED_DIR, 'specialist_note.pkl'), 'wb') as f:
+            pickle.dump(spec_note, f)
     
     # Pharmacy
-    print(f"       Training Pharmacy...", end=" ", flush=True)
-    spec_pharm = PharmacySpecialist()
-    spec_pharm.learn(df_train['med_list_text'].fillna('').tolist(), X_ctx_full, y_train)
-    oof_test['pharm'], _ = spec_pharm.give_opinion(df_test['med_list_text'].fillna('').tolist(), X_ctx_test)
-    print(f"Test AUC: {roc_auc_score(y_test, oof_test['pharm']):.4f}")
-    with open(os.path.join(SHARED_DIR, 'specialist_pharm.pkl'), 'wb') as f:
-        pickle.dump(spec_pharm, f)
+    if 'pharm' in update_specialists:
+        print(f"       Training Pharmacy...", end=" ", flush=True)
+        spec_pharm = PharmacySpecialist()
+        spec_pharm.learn(df_train['med_list_text'].fillna('').tolist(), X_ctx_full, y_train)
+        oof_test['pharm'], _ = spec_pharm.give_opinion(df_test['med_list_text'].fillna('').tolist(), X_ctx_test)
+        print(f"Test AUC: {roc_auc_score(y_test, oof_test['pharm']):.4f}")
+        with open(os.path.join(SHARED_DIR, 'specialist_pharm.pkl'), 'wb') as f:
+            pickle.dump(spec_pharm, f)
     
     # History
-    print(f"       Training History...", end=" ", flush=True)
-    spec_hist = HistorySpecialist()
-    spec_hist.learn(df_train['full_history_text'].fillna('').tolist(), X_ctx_full, y_train)
-    oof_test['hist'], _ = spec_hist.give_opinion(df_test['full_history_text'].fillna('').tolist(), X_ctx_test)
-    print(f"Test AUC: {roc_auc_score(y_test, oof_test['hist']):.4f}")
-    with open(os.path.join(SHARED_DIR, 'specialist_hist.pkl'), 'wb') as f:
-        pickle.dump(spec_hist, f)
+    if 'hist' in update_specialists:
+        print(f"       Training History...", end=" ", flush=True)
+        spec_hist = HistorySpecialist()
+        spec_hist.learn(df_train['full_history_text'].fillna('').tolist(), X_ctx_full, y_train)
+        oof_test['hist'], _ = spec_hist.give_opinion(df_test['full_history_text'].fillna('').tolist(), X_ctx_test)
+        print(f"Test AUC: {roc_auc_score(y_test, oof_test['hist']):.4f}")
+        with open(os.path.join(SHARED_DIR, 'specialist_hist.pkl'), 'wb') as f:
+            pickle.dump(spec_hist, f)
     
     # Psychosocial
-    print(f"       Training Psychosocial...", end=" ", flush=True)
-    spec_psych = PsychosocialSpecialist()
-    spec_psych.learn(
-        df_train['clinical_text'].fillna('').tolist(), X_ctx_full, y_train,
-        med_list=df_train['med_list_text'].fillna('').tolist()
-    )
-    op_psych_test, _, psych_sub_test = spec_psych.give_opinion(
-        df_test['clinical_text'].fillna('').tolist(), X_ctx_test,
-        med_list=df_test['med_list_text'].fillna('').tolist()
-    )
-    oof_test['psych'] = op_psych_test
-    oof_test['psych_mental'] = psych_sub_test['mental']
-    oof_test['psych_care'] = psych_sub_test['care']
-    oof_test['psych_social'] = psych_sub_test['social']
-    print(f"Test AUC: {roc_auc_score(y_test, oof_test['psych']):.4f}")
-    with open(os.path.join(SHARED_DIR, 'specialist_psych.pkl'), 'wb') as f:
-        pickle.dump(spec_psych, f)
+    if 'psych' in update_specialists:
+        print(f"       Training Psychosocial...", end=" ", flush=True)
+        spec_psych = PsychosocialSpecialist()
+        spec_psych.learn(
+            df_train['clinical_text'].fillna('').tolist(), X_ctx_full, y_train,
+            med_list=df_train['med_list_text'].fillna('').tolist()
+        )
+        op_psych_test, _, psych_sub_test = spec_psych.give_opinion(
+            df_test['clinical_text'].fillna('').tolist(), X_ctx_test,
+            med_list=df_test['med_list_text'].fillna('').tolist()
+        )
+        oof_test['psych'] = op_psych_test
+        oof_test['psych_mental'] = psych_sub_test['mental']
+        oof_test['psych_care'] = psych_sub_test['care']
+        oof_test['psych_social'] = psych_sub_test['social']
+        print(f"Test AUC: {roc_auc_score(y_test, oof_test['psych']):.4f}")
+        with open(os.path.join(SHARED_DIR, 'specialist_psych.pkl'), 'wb') as f:
+            pickle.dump(spec_psych, f)
     
     # Create DataFrames
     train_oof_df = pd.DataFrame({
@@ -1598,14 +1636,17 @@ def run_arch6_temporal(train_oof, test_oof, train_ctx, test_ctx, df_train, df_te
 # =============================================================================
 # MAIN COMPARISON
 # =============================================================================
-def run_full_comparison(arch_nums: List[int], skip_specialist_training: bool = False, debug: bool = False, half_data: bool = False):
+def run_full_comparison(arch_nums: List[int], skip_specialist_training: bool = False, debug: bool = False, half_data: bool = False, update_specialists: List[str] = None):
     """Run specified architectures and compare results."""
+    if update_specialists is None:
+        update_specialists = ['lab', 'note', 'pharm', 'hist', 'psych']
     
     print("\n" + "=" * 70)
     print("MULTI-AGENT ARCHITECTURE COMPARISON")
     print("=" * 70)
     print(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Architectures to run: {arch_nums}")
+    print(f"Specialists to update: {update_specialists}")
     
     if debug:
         print("\n⚠️  DEBUG MODE ACTIVE: USING ONLY 2000 ROWS  ⚠️")
@@ -1685,8 +1726,9 @@ def run_full_comparison(arch_nums: List[int], skip_specialist_training: bool = F
             n_folds = DEFAULT_N_FOLDS
         print(f"   Using {n_folds}-fold CV")
         train_oof, test_oof = train_specialists_and_save_oof(
-            df_train, df_test, n_folds=n_folds
+            df_train, df_test, n_folds=n_folds, update_specialists=update_specialists
         )
+
         train_ctx = _create_context_features(df_train)
         train_ctx['split'] = 'train'
         test_ctx = _create_context_features(df_test)
@@ -1869,15 +1911,28 @@ def main():
         '--half-data', action='store_true',
         help='Use half the data for testing (faster, good for validation)'
     )
+    parser.add_argument(
+        '--update-specialists', type=str, default='all',
+        help='Comma-separated list of specialists to update (e.g., "note,lab" or "all" or "none")'
+    )
     args = parser.parse_args()
     
     arch_nums = [int(x.strip()) for x in args.arch.split(',')]
+    
+    # Parse update_specialists
+    if args.update_specialists.lower() == 'all':
+        update_specs = ['lab', 'note', 'pharm', 'hist', 'psych']
+    elif args.update_specialists.lower() == 'none':
+        update_specs = []
+    else:
+        update_specs = [x.strip().lower() for x in args.update_specialists.split(',')]
     
     results = run_full_comparison(
         arch_nums=arch_nums,
         skip_specialist_training=args.skip_specialist_training,
         debug=args.debug,
-        half_data=args.half_data
+        half_data=args.half_data,
+        update_specialists=update_specs
     )
     
     return results
